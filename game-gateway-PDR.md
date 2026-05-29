@@ -45,7 +45,7 @@
 ### 2.1 总体拓扑
 
 ```
-┌──────────────┐   游戏协议(TCP/KCP)    ┌─────────────────────────────┐   HTTPS + SSE   ┌──────────────┐
+┌──────────────┐   游戏协议(TCP)        ┌─────────────────────────────┐   HTTPS + SSE   ┌──────────────┐
 │ C++ 游戏客户端 │ ───────────────────▶ │        游戏 AI 网关          │ ──────────────▶ │  Dify 后端    │
 │              │ ◀─────────────────── │ (本文档实现，Go)             │ ◀────────────── │ (App API)    │
 └──────────────┘   流式分帧回包         └─────────────────────────────┘   /v1/*         └──────┬───────┘
@@ -78,7 +78,7 @@
 | 项 | 选型 | 理由 |
 |---|---|---|
 | 语言 | **Go 1.22+** | 高并发网络服务原生友好；单二进制部署；SSE/HTTP 客户端库成熟；goroutine 天然适配「一请求一协程」模型 |
-| 客户端协议 | **Protobuf over TCP/KCP** | 与现有游戏网络栈一致；强类型；向后兼容 |
+| 客户端协议 | **Protobuf over TCP** | 直接使用 TCP 长连接承载游戏网关协议；强类型；向后兼容 |
 | 会话/限流存储 | **Redis** | conversation 映射、滑动窗口限流、结果缓存 |
 | 配置 | 环境变量 + YAML | 12-factor；密钥走 Secrets/KMS |
 | 可观测 | OpenTelemetry + Prometheus | 指标与追踪标准化 |
@@ -132,7 +132,7 @@
 
 ### 4.1 传输与分帧
 
-- 传输：TCP（或 KCP）。
+- 传输：TCP 长连接。
 - 分帧：`4 字节大端长度前缀 + Protobuf 负载`。长度上限 4 MB，超限断连。
 - 心跳：客户端每 15s 发 Ping，网关回 Pong；60s 无活动断连。
 
@@ -394,7 +394,7 @@ game-gateway/
 ├── cmd/gateway/main.go            # 启动、装配依赖、优雅退出
 ├── internal/
 │   ├── config/                    # 配置与环境变量加载、校验
-│   ├── listener/                  # TCP/KCP 接入、分帧、连接管理
+│   ├── listener/                  # TCP 接入、分帧、连接管理
 │   ├── codec/                     # Protobuf 编解码
 │   ├── session/                   # 连接会话状态、player 绑定
 │   ├── auth/                      # session token 校验
@@ -452,16 +452,19 @@ type SessionStore interface {
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `GATEWAY_ADDR` | 否 | `:9000` | 监听地址 |
+| `GATEWAY_ADDR` | 否 | `:9000` | TCP 业务监听地址 |
+| `GATEWAY_ADMIN_ADDR` | 否 | `:9001` | HTTP 管理监听地址，承载 `/metrics` 与后续健康检查 |
 | `DIFY_BASE_URL` | 是 | — | 如 `http://dify-api/v1` |
-| `DIFY_APP_KEYS` | 是 | — | `npc_id=app-xxx;default=app-yyy` 多应用映射 |
+| `DIFY_APP_KEYS` | 是 | — | `npc_id=app-xxx;default=app-yyy` 多应用映射；`;` 分隔条目，首个 `=` 分隔 key/value，key 与 value 去首尾空白后均不能为空，非法格式 fail-fast |
 | `REDIS_ADDR` | 是 | — | Redis 地址 |
-| `AUTH_JWT_PUBKEY` | 是 | — | 登录服 JWT 验签公钥 |
+| `AUTH_JWT_PUBKEY` | 是 | — | 登录服 JWT 验签公钥 PEM 字符串；换行可写为 `\\n`，M0-T2 仅规范化换行并透传，M2-T3 负责解析和验签 |
 | `UPSTREAM_TIMEOUT_SEC` | 否 | `60` | Dify 调用总超时 |
 | `RATE_PER_PLAYER` | 否 | `1r/2s` | 单玩家限流 |
 | `TOKEN_BUDGET_DAILY` | 否 | `100000` | 单玩家日 token 预算 |
 | `MAX_INFLIGHT_UPSTREAM` | 否 | `200` | 全局在途上游请求上限 |
 | `MODERATION_ENABLED` | 否 | `true` | 是否启用审核 |
+| `GATEWAY_SERVICE_NAME` | 否 | `game-ai-gateway` | OpenTelemetry service.name |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | 否 | 空 | OTLP exporter endpoint；空表示暂不启用远端导出 |
 
 ---
 
@@ -484,9 +487,9 @@ type SessionStore interface {
 ### 里程碑 M0 — 工程骨架
 
 **M0-T1 初始化项目骨架**
-- 目标：建立第 9 章目录结构、`go.mod`、lint/CI、Dockerfile。
+- 目标：建立第 9 章目录结构、`go.mod`、lint/CI、Dockerfile，并声明 `make proto` 边界。M0-T1 不生成 Protobuf Go 代码；`make proto` 在未安装 `protoc`/`protoc-gen-go` 或未进入 M2-T1 前必须给出明确提示并失败，`make build` 不隐含执行 proto 生成。
 - 依赖：无。
-- 产出物：可编译的空骨架、`make build/test/lint` 可用。
+- 产出物：可编译的空骨架、`make build/test/lint` 可用；GitHub Actions workflow 位于 `.github/workflows/ci.yml`，在 PR 与 push main 时运行 build/test/lint。
 - 验收：`go build ./...` 与 `go test ./...` 通过；CI 绿。
 
 **M0-T2 配置加载模块 (`config`)**

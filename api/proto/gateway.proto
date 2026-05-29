@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package gateway;
+
+option go_package = "dify_gateway/api/proto;gatewaypb";
+
+// M2-T1 will generate Go bindings from this contract.
+message ClientEnvelope {}
+message ServerEnvelope {}

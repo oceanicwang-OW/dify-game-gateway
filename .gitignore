@@ -1,0 +1,13 @@
+# Go build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Local env and editor state
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
