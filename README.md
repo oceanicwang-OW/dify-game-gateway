@@ -4,7 +4,7 @@
 
 Dify 游戏 AI 网关是位于游戏客户端和 Dify 之间的 Go 服务层。它用于把 Dify App API Key 保留在服务端，将游戏请求转换为 Dify API 调用，把模型输出流式返回给游戏客户端，并为鉴权、限流、内容审核、可观测性和会话管理提供基础。
 
-本仓库仍处于里程碑开发阶段。当前已实现的范围包括项目骨架、配置加载、可观测性基座、Dify client 包、Protobuf 协议与分帧编解码、TCP 接入层、JWT 鉴权，以及 Redis 会话存储。
+本仓库仍处于里程碑开发阶段。当前已实现的范围包括项目骨架、配置加载、可观测性基座、Dify client 包、Protobuf 协议与分帧编解码、TCP 接入层、JWT 鉴权、Redis 会话存储、上下文装配、限流/配额/熔断，以及内容审核。
 
 ### 功能特性
 
@@ -22,8 +22,11 @@ Dify 游戏 AI 网关是位于游戏客户端和 Dify 之间的 Go 服务层。�
 - TCP 接入层：每连接一 goroutine、心跳、连接级写串行化、按 `request_id` 多路复用（`internal/listener`、`internal/session`、`internal/mux`）。
 - JWT session token 验签与 player 绑定，算法锁定到公钥族，拒绝 `alg=none` 与 HMAC alg-confusion（`internal/auth`）。
 - Redis 会话存储：`conv:{player}:{npc}` 映射的增删查与 TTL，以及首次会话创建的分布式锁（`internal/store`）。
+- 上下文装配：从可信 provider 组装 Dify `inputs`，仅允许变量契约内的键，来源失败时降级为部分上下文（`internal/context`）。
+- 限流/配额/熔断：Redis 滑动窗口单玩家限流、每日 token 预算、全局在途上游信号量，以及熔断状态指标（`internal/limiter`）。
+- 内容审核：输入审核与流式输出句级缓冲审核，支持跨 chunk 敏感内容阻断（`internal/moderation`）。
 
-尚未实现：上下文装配、限流器、内容审核，以及完整端到端网关编排（主链路与 Stop/Reset 对接）。
+尚未实现：完整端到端网关编排（主链路与 Stop/Reset 对接）。
 
 ### 目录结构
 
@@ -38,6 +41,9 @@ internal/session/     连接会话状态与 player 绑定
 internal/mux/         单连接写串行化与请求多路复用
 internal/auth/        JWT session token 验签
 internal/store/       Redis 会话映射与会话创建锁
+internal/limiter/     限流、配额与熔断
+internal/context/     玩家上下文拉取与 inputs 装配
+internal/moderation/  输入与流式输出审核
 internal/telemetry/   指标、JSON 日志和脱敏 helper
 deploy/               部署工作区
 test/                 验证脚本和后续集成测试
@@ -49,7 +55,7 @@ test/                 验证脚本和后续集成测试
 
 - Go 1.23 或更高版本
 - Dify App API endpoint 和 app API key
-- Redis 地址和 JWT 公钥目前会被配置校验要求提供，实际运行消费这些配置的模块将在后续里程碑实现
+- Redis 地址用于会话和限流存储；JWT 公钥用于 session token 鉴权
 
 ### 配置项
 
@@ -61,13 +67,13 @@ test/                 验证脚本和后续集成测试
 | `GATEWAY_ADMIN_ADDR` | 否 | `:9001` | 后续管理 HTTP 地址，用于 metrics 和健康检查 |
 | `DIFY_BASE_URL` | 是 | | Dify API base URL，例如 `http://dify-api/v1` |
 | `DIFY_APP_KEYS` | 是 | | App key 映射，例如 `default=app-xxx;npc-blacksmith=app-yyy` |
-| `REDIS_ADDR` | 是 | | 后续会话/限流存储使用的 Redis 地址 |
+| `REDIS_ADDR` | 是 | | 会话/限流存储使用的 Redis 地址 |
 | `AUTH_JWT_PUBKEY` | 是 | | JWT 公钥 PEM；转义的 `\n` 会被规范化 |
 | `UPSTREAM_TIMEOUT_SEC` | 否 | `60` | 规划中的上游调用超时 |
-| `RATE_PER_PLAYER` | 否 | `1r/2s` | 规划中的单玩家限流 |
-| `TOKEN_BUDGET_DAILY` | 否 | `100000` | 规划中的单玩家每日 token 预算 |
-| `MAX_INFLIGHT_UPSTREAM` | 否 | `200` | 规划中的全局上游并发上限 |
-| `MODERATION_ENABLED` | 否 | `true` | 规划中的内容审核开关 |
+| `RATE_PER_PLAYER` | 否 | `1r/2s` | 单玩家限流 |
+| `TOKEN_BUDGET_DAILY` | 否 | `100000` | 单玩家每日 token 预算 |
+| `MAX_INFLIGHT_UPSTREAM` | 否 | `200` | 全局上游并发上限 |
+| `MODERATION_ENABLED` | 否 | `true` | 内容审核开关 |
 | `GATEWAY_SERVICE_NAME` | 否 | `game-ai-gateway` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | 否 | | 可选 OTLP endpoint |
 
@@ -169,11 +175,13 @@ docker run --rm `
 - M2-T3 JWT 鉴权
 - M3-T1 Redis 会话存储与会话创建锁
 - M3-T2 上下文装配
+- M3-T3 限流/配额/熔断
 - M3-T4 内容审核
 
 下一个计划里程碑：
 
-- M3-T3 限流/配额/熔断
+- M4-T1 对话主链路编排
+- M4-T2 中止与会话管理对接
 
 ### 安全注意事项
 
@@ -187,7 +195,7 @@ docker run --rm `
 
 Dify Game AI Gateway is a Go service layer between a game client and Dify. It keeps Dify App API keys on the server side, translates game requests into Dify API calls, streams model output back to the game client, and provides the foundation for auth, rate limiting, moderation, observability, and session management.
 
-This repository is under active milestone development. The implemented surface currently covers the project skeleton, configuration, telemetry, the Dify client package, the Protobuf protocol and frame codec, the TCP access layer, JWT authentication, and the Redis session store.
+This repository is under active milestone development. The implemented surface currently covers the project skeleton, configuration, telemetry, the Dify client package, the Protobuf protocol and frame codec, the TCP access layer, JWT authentication, the Redis session store, context assembly, rate limiting / quota / circuit breaking, and moderation.
 
 ### Features
 
@@ -205,8 +213,11 @@ This repository is under active milestone development. The implemented surface c
 - TCP access layer: one goroutine per connection, heartbeat, connection-level write serialization, and `request_id` multiplexing (`internal/listener`, `internal/session`, `internal/mux`).
 - JWT session-token verification and player binding, with algorithms pinned to the key family and `alg=none`/HMAC alg-confusion rejected (`internal/auth`).
 - Redis session store: `conv:{player}:{npc}` mapping CRUD with TTL plus the distributed lock for first-time conversation creation (`internal/store`).
+- Context assembly from trusted providers into Dify `inputs`, admitting only contract keys and degrading to partial context when a source is unavailable (`internal/context`).
+- Rate limiting, quota, and circuit breaking: Redis sliding-window per-player limits, daily token budgets, a global upstream in-flight semaphore, and circuit state metrics (`internal/limiter`).
+- Moderation for input and sentence-buffered streaming output, including detection of blocked content split across chunks (`internal/moderation`).
 
-Not yet implemented: context assembler, limiter, moderation, and full end-to-end gateway orchestration (main pipeline and Stop/Reset wiring).
+Not yet implemented: full end-to-end gateway orchestration (main pipeline and Stop/Reset wiring).
 
 ### Repository Layout
 
@@ -221,6 +232,9 @@ internal/session/     Connection session state and player binding
 internal/mux/         Single-connection write serialization and request multiplexing
 internal/auth/        JWT session-token verification
 internal/store/       Redis conversation mapping and creation lock
+internal/limiter/     Rate limiting, quota, and circuit breaking
+internal/context/     Player context fetching and inputs assembly
+internal/moderation/  Input and streaming-output moderation
 internal/telemetry/   Metrics, JSON logging, and redaction helpers
 deploy/               Deployment workspace
 test/                 Verification scripts and future integration tests
@@ -232,7 +246,7 @@ The detailed product and implementation plan lives in [game-gateway-PDR.md](./ga
 
 - Go 1.23 or newer
 - Dify App API endpoint and app API key
-- Redis and JWT public key values are required by configuration validation, although their runtime consumers are planned for later milestones
+- Redis is used for session and rate-limit storage; the JWT public key is used for session-token authentication
 
 ### Configuration
 
@@ -244,13 +258,13 @@ The gateway reads configuration from environment variables.
 | `GATEWAY_ADMIN_ADDR` | No | `:9001` | Future admin HTTP address for metrics and health endpoints |
 | `DIFY_BASE_URL` | Yes | | Dify API base URL, for example `http://dify-api/v1` |
 | `DIFY_APP_KEYS` | Yes | | App key mapping, for example `default=app-xxx;npc-blacksmith=app-yyy` |
-| `REDIS_ADDR` | Yes | | Redis address for later session/rate-limit storage |
+| `REDIS_ADDR` | Yes | | Redis address for session/rate-limit storage |
 | `AUTH_JWT_PUBKEY` | Yes | | JWT public key PEM. Escaped `\n` sequences are normalized |
-| `UPSTREAM_TIMEOUT_SEC` | No | `60` | Planned upstream call timeout |
-| `RATE_PER_PLAYER` | No | `1r/2s` | Planned per-player rate limit |
-| `TOKEN_BUDGET_DAILY` | No | `100000` | Planned daily token budget per player |
-| `MAX_INFLIGHT_UPSTREAM` | No | `200` | Planned global upstream concurrency limit |
-| `MODERATION_ENABLED` | No | `true` | Planned moderation switch |
+| `UPSTREAM_TIMEOUT_SEC` | No | `60` | Upstream call timeout |
+| `RATE_PER_PLAYER` | No | `1r/2s` | Per-player rate limit |
+| `TOKEN_BUDGET_DAILY` | No | `100000` | Daily token budget per player |
+| `MAX_INFLIGHT_UPSTREAM` | No | `200` | Global upstream concurrency limit |
+| `MODERATION_ENABLED` | No | `true` | Moderation switch |
 | `GATEWAY_SERVICE_NAME` | No | `game-ai-gateway` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | | Optional OTLP endpoint |
 
@@ -352,11 +366,13 @@ Completed milestone scope:
 - M2-T3 JWT authentication
 - M3-T1 Redis session store and conversation creation lock
 - M3-T2 context assembler
+- M3-T3 rate limiting / quota / circuit breaker
 - M3-T4 content moderation
 
 Next planned milestone:
 
-- M3-T3 rate limiting / quota / circuit breaker
+- M4-T1 main chat pipeline orchestration
+- M4-T2 stop and conversation management wiring
 
 ### Security Notes
 
