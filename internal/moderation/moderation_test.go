@@ -104,6 +104,62 @@ func TestOutputFilterCatchesContentSplitAcrossDeltas(t *testing.T) {
 	}
 }
 
+// TestOutputFilterCatchesTokenSplitAcrossTerminator covers the spurious-
+// terminator hole: a banned token containing '.' (URL/decimal) lands across a
+// segment boundary, yet the moderation overlap re-checks it as one unit.
+func TestOutputFilterCatchesTokenSplitAcrossTerminator(t *testing.T) {
+	f := NewOutputFilter(newMod("evil.com"))
+	ctx := context.Background()
+
+	// Deltas chosen so the '.' inside "evil.com" forces a segment cut, leaving
+	// "evil." in one segment and "com" in the next.
+	if emit, blocked, _ := f.Push(ctx, "visit ev"); emit != "" || blocked {
+		t.Fatalf("first push = (%q, %v), want buffered", emit, blocked)
+	}
+	if _, blocked, _ := f.Push(ctx, "il.co"); blocked {
+		// "visit evil." is emitted here and must NOT yet block (no full match).
+		t.Fatal("blocked prematurely on partial token")
+	}
+	_, blocked, fb := f.Push(ctx, "m now.")
+	if !blocked || fb != DefaultOutputFallback {
+		t.Fatalf("token split across '.' not caught: blocked=%v fb=%q", blocked, fb)
+	}
+}
+
+// TestOutputFilterOverlapCatchesAcrossCapBoundary covers the cap/space-less
+// (CJK-like) hole: a banned word split across the size cap is caught via the
+// moderation overlap even though no whitespace lets the tail recombine.
+func TestOutputFilterOverlapCatchesAcrossCapBoundary(t *testing.T) {
+	f := NewOutputFilter(newMod("violence"))
+	f.maxSegmentBytes = 8 // force early, space-less cap emits
+	ctx := context.Background()
+
+	// "xxxxxviol" (9B, no space) exceeds the cap and is emitted whole (tail="");
+	// without the overlap, the trailing "viol" would be lost.
+	if _, blocked, _ := f.Push(ctx, "xxxxxviol"); blocked {
+		t.Fatal("blocked prematurely")
+	}
+	_, blocked, fb := f.Push(ctx, "ence now")
+	if !blocked || fb != DefaultOutputFallback {
+		t.Fatalf("word split across cap boundary not caught: blocked=%v fb=%q", blocked, fb)
+	}
+}
+
+func TestLastRunes(t *testing.T) {
+	if got := lastRunes("abcdef", 3); got != "def" {
+		t.Fatalf("lastRunes = %q, want def", got)
+	}
+	if got := lastRunes("ab", 5); got != "ab" {
+		t.Fatalf("lastRunes shorter = %q, want ab", got)
+	}
+	if got := lastRunes("你好世界", 2); got != "世界" {
+		t.Fatalf("lastRunes CJK = %q, want 世界", got)
+	}
+	if got := lastRunes("abc", 0); got != "" {
+		t.Fatalf("lastRunes 0 = %q, want empty", got)
+	}
+}
+
 func TestOutputFilterEmitsThenBlocksLaterSentence(t *testing.T) {
 	f := NewOutputFilter(newMod("violence"))
 	ctx := context.Background()

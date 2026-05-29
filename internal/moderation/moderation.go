@@ -120,19 +120,38 @@ const sentenceTerminators = "。！？.!?\n"
 // run-on streams.
 const DefaultMaxSegmentBytes = 512
 
+// DefaultOverlapRunes is how many trailing runes of already-emitted text are
+// re-included as context when moderating the next segment, so a banned token
+// straddling a segment boundary is still caught. It bounds the longest banned
+// phrase reliably detected across a boundary; phrases longer than this could
+// still split (an accepted, documented limit).
+const DefaultOverlapRunes = 32
+
 // OutputFilter buffers streamed deltas into complete sentences, moderates each
 // completed segment, and emits only text that passed (§6.4). On a hit it latches
 // blocked and yields the fallback; no further output should be forwarded.
+//
+// Segments are moderated together with an overlap of the previously-emitted
+// text (overlapRunes), so content split across a segment boundary — a sentence
+// terminator, a spurious '.' inside a URL/decimal, the size cap, or a
+// space-less CJK run — is still detected. The overlap is context only and is
+// never re-emitted.
 type OutputFilter struct {
 	mod             Moderator
 	buf             strings.Builder
 	maxSegmentBytes int
+	overlapRunes    int
+	overlap         string
 	blocked         bool
 }
 
 // NewOutputFilter creates a filter over mod.
 func NewOutputFilter(mod Moderator) *OutputFilter {
-	return &OutputFilter{mod: mod, maxSegmentBytes: DefaultMaxSegmentBytes}
+	return &OutputFilter{
+		mod:             mod,
+		maxSegmentBytes: DefaultMaxSegmentBytes,
+		overlapRunes:    DefaultOverlapRunes,
+	}
 }
 
 // Push buffers a delta and moderates any newly-completed sentence(s). It returns
@@ -166,32 +185,31 @@ func (f *OutputFilter) drain(ctx context.Context, final bool) (emit string, bloc
 	}
 
 	var segment, remainder string
-	switch {
-	case final:
+	if final {
 		// Stream ended: moderate everything that's left.
 		segment, remainder = text, ""
-	case cutAtLastTerminator(text) >= 0:
-		cut := cutAtLastTerminator(text)
+	} else if cut := cutAtLastTerminator(text); cut >= 0 {
 		segment, remainder = text[:cut], text[cut:]
-	case len(text) >= f.maxSegmentBytes:
+	} else if len(text) >= f.maxSegmentBytes {
 		// Run-on with no terminator: force a check, keeping a trailing partial
 		// token so a word split at the cap can still recombine on the next push.
 		segment, remainder = splitKeepingLastToken(text)
-	default:
+	} else {
 		return "", false, "" // incomplete sentence; wait for more
 	}
 
-	if segment == "" {
-		return "", false, ""
-	}
-
-	allowed, fb := f.mod.CheckOutput(ctx, segment)
+	// Moderate the segment together with the trailing overlap of already-emitted
+	// text so a banned token straddling the previous boundary is still caught.
+	// The overlap is context only; only `segment` (new text) is emitted.
+	allowed, fb := f.mod.CheckOutput(ctx, f.overlap+segment)
 	if !allowed {
 		f.blocked = true
 		f.buf.Reset()
+		f.overlap = ""
 		return "", true, fb
 	}
 
+	f.overlap = lastRunes(f.overlap+segment, f.overlapRunes)
 	f.buf.Reset()
 	f.buf.WriteString(remainder)
 	return segment, false, ""
@@ -206,6 +224,19 @@ func cutAtLastTerminator(text string) int {
 	}
 	_, size := utf8.DecodeRuneInString(text[idx:])
 	return idx + size
+}
+
+// lastRunes returns the last n runes of s (or all of s if shorter). It is
+// rune-aware so the overlap never splits a multibyte character.
+func lastRunes(s string, n int) string {
+	if n <= 0 || s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[len(runes)-n:])
 }
 
 // splitKeepingLastToken splits text after the last whitespace, returning the
