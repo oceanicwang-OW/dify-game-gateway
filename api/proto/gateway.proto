@@ -4,6 +4,48 @@ package gateway;
 
 option go_package = "dify_gateway/api/proto;gatewaypb";
 
-// M2-T1 will generate Go bindings from this contract.
-message ClientEnvelope {}
-message ServerEnvelope {}
+// 客户端 -> 网关
+message ClientEnvelope {
+  oneof body {
+    AuthRequest auth = 1;
+    ChatRequest chat = 2;
+    StopRequest stop = 3;
+    Ping        ping = 4;
+  }
+}
+
+message AuthRequest {
+  string session_token = 1; // 游戏登录服下发
+  string player_id     = 2;
+}
+
+message ChatRequest {
+  string request_id      = 1; // 客户端生成，回包据此归位
+  string conversation_id = 2; // 空=新会话；通常由网关托管，客户端可不传
+  string npc_id          = 3; // 对话对象，用于选择 Dify 应用/会话隔离
+  string query           = 4; // 玩家输入
+  map<string, string> context = 5; // 可选：客户端侧附加上下文
+}
+
+message StopRequest { string request_id = 1; } // 中止生成
+message Ping {}
+
+// 网关 -> 客户端
+message ServerEnvelope {
+  oneof body {
+    AuthResult  auth_result = 1;
+    ChatChunk   chunk       = 2;
+    ChatDone    done        = 3;
+    ErrorMsg    error       = 4;
+    Pong        pong        = 5;
+    ChatBlocked blocked     = 6;
+  }
+}
+
+message AuthResult { bool ok = 1; string reason = 2; }
+message ChatChunk  { string request_id = 1; string delta = 2; }
+message ChatDone   { string request_id = 1; string conversation_id = 2; uint32 total_tokens = 3; }
+message ErrorMsg   { string request_id = 1; string code = 2; string message = 3; }
+// 审核命中终止帧：客户端收到后须丢弃该 request_id 已收的全部增量，展示 fallback 文案。
+message ChatBlocked { string request_id = 1; string fallback = 2; }
+message Pong {}
