@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -140,7 +141,7 @@ func TestConcurrentFirstRequestsCreateOnce(t *testing.T) {
 	var creations atomic.Int64
 	// createConversation simulates the orchestration "first request" flow:
 	// lock -> re-check mapping -> create+store only if still absent -> unlock.
-	createConversation := func(seq int) (string, error) {
+	createConversation := func() (string, error) {
 		unlock, err := s.AcquireConversationLock(ctx, "player-1", "npc-1", time.Minute)
 		if err != nil {
 			return "", err
@@ -169,7 +170,7 @@ func TestConcurrentFirstRequestsCreateOnce(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			results[idx], errs[idx] = createConversation(idx)
+			results[idx], errs[idx] = createConversation()
 		}(i)
 	}
 	wg.Wait()
@@ -189,5 +190,87 @@ func TestConcurrentFirstRequestsCreateOnce(t *testing.T) {
 	got, _ := s.GetConversation(ctx, "player-1", "npc-1")
 	if got != "conv-created" {
 		t.Fatalf("final mapping = %q, want conv-created", got)
+	}
+}
+
+func TestAcquireLockUnblocksOnContextCancel(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	held, err := s.AcquireConversationLock(context.Background(), "player-1", "npc-1", time.Minute)
+	if err != nil {
+		t.Fatalf("first Acquire error = %v", err)
+	}
+	defer held()
+
+	cctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, e := s.AcquireConversationLock(cctx, "player-1", "npc-1", time.Minute)
+		errCh <- e
+	}()
+
+	time.Sleep(50 * time.Millisecond) // let it enter the retry loop
+	cancel()
+
+	select {
+	case e := <-errCh:
+		if !errors.Is(e, context.Canceled) {
+			t.Fatalf("Acquire error = %v, want context.Canceled", e)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Acquire did not return after context cancel")
+	}
+}
+
+func TestUnlockIsIdempotent(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	unlock, err := s.AcquireConversationLock(ctx, "player-1", "npc-1", time.Minute)
+	if err != nil {
+		t.Fatalf("Acquire error = %v", err)
+	}
+	unlock()
+	unlock() // second call must be a no-op, not a panic
+
+	if held, _ := s.client.Exists(ctx, lockKey("player-1", "npc-1")).Result(); held != 0 {
+		t.Fatalf("lock still held after unlock, exists = %d", held)
+	}
+}
+
+func TestLockTTLMakesItReacquirableAfterHolderDeath(t *testing.T) {
+	s, mr := newTestStore(t)
+	ctx := context.Background()
+
+	// Acquire and "die" without unlocking.
+	if _, err := s.AcquireConversationLock(ctx, "player-1", "npc-1", 50*time.Millisecond); err != nil {
+		t.Fatalf("Acquire error = %v", err)
+	}
+	// Before TTL: a short-ctx acquire must fail (still held).
+	shortCtx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	defer cancel()
+	if _, err := s.AcquireConversationLock(shortCtx, "player-1", "npc-1", time.Minute); err == nil {
+		t.Fatal("acquired while lock still held, want failure")
+	}
+	// After TTL expiry the lock is reclaimable.
+	mr.FastForward(100 * time.Millisecond)
+	unlock, err := s.AcquireConversationLock(ctx, "player-1", "npc-1", time.Minute)
+	if err != nil {
+		t.Fatalf("reacquire after TTL expiry error = %v", err)
+	}
+	unlock()
+}
+
+func TestSetConversationRejectsNonPositiveTTL(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	for _, ttl := range []time.Duration{0, -time.Second} {
+		if err := s.SetConversation(ctx, "player-1", "npc-1", "conv", ttl); err == nil {
+			t.Fatalf("SetConversation(ttl=%v) error = nil, want error", ttl)
+		}
+	}
+	// Nothing should have been written.
+	if got, _ := s.GetConversation(ctx, "player-1", "npc-1"); got != "" {
+		t.Fatalf("mapping = %q after rejected writes, want empty", got)
 	}
 }

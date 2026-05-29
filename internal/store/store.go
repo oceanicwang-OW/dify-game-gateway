@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -18,6 +19,10 @@ import (
 // lockRetryInterval is how long Acquire waits between contended attempts. It is
 // a var so tests can shrink it.
 var lockRetryInterval = 20 * time.Millisecond
+
+// releaseTimeout bounds the token-guarded release call so a dead Redis cannot
+// block unlock for the client's default timeout.
+var releaseTimeout = 5 * time.Second
 
 // releaseScript deletes the lock key only if it still holds our token, so a
 // caller can never release a lock that a different holder acquired after our
@@ -60,8 +65,13 @@ func (s *RedisStore) GetConversation(ctx context.Context, playerID, npcID string
 	return val, nil
 }
 
-// SetConversation stores the mapping with the given inactivity TTL.
+// SetConversation stores the mapping with the given inactivity TTL. A
+// non-positive TTL is rejected: passing it to Redis would create a mapping that
+// never expires, defeating the §7.2 inactivity-expiry contract.
 func (s *RedisStore) SetConversation(ctx context.Context, playerID, npcID, convID string, ttl time.Duration) error {
+	if ttl <= 0 {
+		return fmt.Errorf("store: set conversation: ttl must be positive, got %v", ttl)
+	}
 	if err := s.client.Set(ctx, conversationKey(playerID, npcID), convID, ttl).Err(); err != nil {
 		return fmt.Errorf("store: set conversation: %w", err)
 	}
@@ -108,14 +118,15 @@ func (s *RedisStore) AcquireConversationLock(ctx context.Context, playerID, npcI
 }
 
 func (s *RedisStore) releaser(key, token string) func() {
-	var released bool
+	var once sync.Once
 	return func() {
-		if released {
-			return
-		}
-		released = true
-		// Best-effort, token-guarded release; ignore errors (TTL is the backstop).
-		_ = releaseScript.Run(context.Background(), s.client, []string{key}, token).Err()
+		once.Do(func() {
+			// Best-effort, token-guarded release; ignore errors (TTL is the
+			// backstop). Bounded ctx so a dead Redis can't block unlock.
+			ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
+			defer cancel()
+			_ = releaseScript.Run(ctx, s.client, []string{key}, token).Err()
+		})
 	}
 }
 
