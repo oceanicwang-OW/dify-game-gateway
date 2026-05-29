@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -116,6 +115,7 @@ func TestClientUploadFileSendsMultipartAndParsesID(t *testing.T) {
 		fields := map[string]string{}
 		var fileName string
 		var fileContent string
+		var fileContentType string
 		for {
 			part, err := reader.NextPart()
 			if err == io.EOF {
@@ -131,6 +131,7 @@ func TestClientUploadFileSendsMultipartAndParsesID(t *testing.T) {
 			if part.FormName() == "file" {
 				fileName = part.FileName()
 				fileContent = string(data)
+				fileContentType = part.Header.Get("Content-Type")
 			} else {
 				fields[part.FormName()] = string(data)
 			}
@@ -141,6 +142,9 @@ func TestClientUploadFileSendsMultipartAndParsesID(t *testing.T) {
 		if fileName != "avatar.png" || fileContent != "png-bytes" {
 			t.Fatalf("fileName=%q fileContent=%q", fileName, fileContent)
 		}
+		if fileContentType != "image/png" {
+			t.Fatalf("file part Content-Type = %q, want image/png", fileContentType)
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"file-123","name":"avatar.png","size":9}`))
@@ -149,9 +153,10 @@ func TestClientUploadFileSendsMultipartAndParsesID(t *testing.T) {
 
 	client := NewClient(server.URL, "app-test-key", server.Client())
 	result, err := client.UploadFile(context.Background(), UploadFileReq{
-		User:     "player-1",
-		Filename: "avatar.png",
-		Reader:   strings.NewReader("png-bytes"),
+		User:        "player-1",
+		Filename:    "avatar.png",
+		Reader:      strings.NewReader("png-bytes"),
+		ContentType: "image/png",
 	})
 	if err != nil {
 		t.Fatalf("UploadFile() error = %v", err)
@@ -241,5 +246,3 @@ func TestClientCheckParameterContractWarnsAboutMismatches(t *testing.T) {
 		t.Fatalf("second warning = %q", warnings[1])
 	}
 }
-
-var _ *multipart.Part

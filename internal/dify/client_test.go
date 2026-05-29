@@ -6,9 +6,19 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestMain shrinks the retry backoff so retry-path tests don't sleep for the
+// production default (500ms+ per attempt).
+func TestMain(m *testing.M) {
+	upstreamRetryBaseBackoff = time.Millisecond
+	upstreamRetryMaxBackoff = 5 * time.Millisecond
+	os.Exit(m.Run())
+}
 
 func TestClientChatSendsBlockingRequestAndParsesResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

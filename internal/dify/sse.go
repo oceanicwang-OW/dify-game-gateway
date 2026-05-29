@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,12 @@ import (
 )
 
 const streamingResponseMode = "streaming"
+
+// ErrStreamIncomplete is returned when the SSE stream ends without a terminal
+// event (message_end/error/message_replace). The orchestration layer uses it to
+// tell an intentional Stop (it called Stop, so truncation is expected) apart
+// from a genuine upstream truncation that should surface as UPSTREAM_ERROR.
+var ErrStreamIncomplete = errors.New("Dify SSE stream ended before terminal event")
 
 type StreamError struct {
 	Code    string
@@ -128,7 +135,7 @@ func parseSSE(r io.Reader, onEvent func(taskID, convID string), onDelta func(del
 	if err := scanner.Err(); err != nil {
 		return result, fmt.Errorf("read Dify SSE stream: %w", err)
 	}
-	return result, fmt.Errorf("Dify SSE stream ended before terminal event")
+	return result, ErrStreamIncomplete
 }
 
 type sseEvent struct {

@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
+	"net/url"
+	"path/filepath"
 	"strings"
 )
 
@@ -23,7 +27,7 @@ func (c *Client) Stop(ctx context.Context, taskID, user string) error {
 	if err != nil {
 		return fmt.Errorf("marshal Dify stop request: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat-messages/"+taskID+"/stop", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat-messages/"+url.PathEscape(taskID)+"/stop", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create Dify stop request: %w", err)
 	}
@@ -57,7 +61,10 @@ func (c *Client) UploadFile(ctx context.Context, req UploadFileReq) (UploadFileR
 	if err := writer.WriteField("user", req.User); err != nil {
 		return UploadFileResult{}, fmt.Errorf("write upload user field: %w", err)
 	}
-	part, err := writer.CreateFormFile("file", req.Filename)
+	partHeader := make(textproto.MIMEHeader)
+	partHeader.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename=%q`, req.Filename))
+	partHeader.Set("Content-Type", fileContentType(req))
+	part, err := writer.CreatePart(partHeader)
 	if err != nil {
 		return UploadFileResult{}, fmt.Errorf("create upload file part: %w", err)
 	}
@@ -153,6 +160,20 @@ func (c *Client) CheckParameterContract(ctx context.Context, expectedVariables [
 func readErrorBody(r io.Reader) string {
 	data, _ := io.ReadAll(io.LimitReader(r, 4096))
 	return strings.TrimSpace(string(data))
+}
+
+// fileContentType resolves the MIME type for an uploaded file part. An explicit
+// req.ContentType wins; otherwise it is inferred from the filename extension,
+// falling back to application/octet-stream. Dify's multimodal upload keys off
+// this, so a missing/wrong type can cause images to be rejected.
+func fileContentType(req UploadFileReq) string {
+	if ct := strings.TrimSpace(req.ContentType); ct != "" {
+		return ct
+	}
+	if ct := mime.TypeByExtension(filepath.Ext(req.Filename)); ct != "" {
+		return ct
+	}
+	return "application/octet-stream"
 }
 
 type parametersPayload struct {

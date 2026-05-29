@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,12 +16,20 @@ import (
 const blockingResponseMode = "blocking"
 const maxUpstreamAttempts = 3
 
-var upstreamRetryBackoff = 10 * time.Millisecond
+// Exponential backoff between upstream retries (PDR §5.6). The delay for the
+// nth failed attempt is base*2^(n-1), capped at the max. Both are vars so tests
+// can shrink them to keep runs fast.
+var (
+	upstreamRetryBaseBackoff = 500 * time.Millisecond
+	upstreamRetryMaxBackoff  = 5 * time.Second
+)
 
 type UpstreamError struct {
 	Operation  string
 	StatusCode int
 	Body       string
+	// RetryAfter is parsed from the upstream Retry-After header (0 if absent).
+	RetryAfter time.Duration
 }
 
 func (e *UpstreamError) Error() string {
@@ -32,6 +41,38 @@ func (e *UpstreamError) Error() string {
 
 func (e *UpstreamError) Retryable() bool {
 	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+}
+
+// retryBackoff returns the exponential backoff for a given 1-indexed attempt,
+// capped at upstreamRetryMaxBackoff.
+func retryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	d := upstreamRetryBaseBackoff
+	for i := 1; i < attempt; i++ {
+		d *= 2
+		if d >= upstreamRetryMaxBackoff {
+			return upstreamRetryMaxBackoff
+		}
+	}
+	if d > upstreamRetryMaxBackoff {
+		return upstreamRetryMaxBackoff
+	}
+	return d
+}
+
+// parseRetryAfter handles the delta-seconds form of the Retry-After header.
+// The rarely-used HTTP-date form is ignored (treated as absent).
+func parseRetryAfter(header string) time.Duration {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(header); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return 0
 }
 
 type Client struct {
@@ -121,7 +162,11 @@ func (c *Client) doRequestWithRetry(ctx context.Context, operation, method, url 
 		if !errors.As(err, &upstreamErr) || !upstreamErr.Retryable() || attempt == maxUpstreamAttempts {
 			return nil, err
 		}
-		if err := sleepBeforeRetry(ctx); err != nil {
+		backoff := retryBackoff(attempt)
+		if upstreamErr.RetryAfter > backoff {
+			backoff = upstreamErr.RetryAfter
+		}
+		if err := sleepBeforeRetry(ctx, backoff); err != nil {
 			return nil, err
 		}
 	}
@@ -151,11 +196,12 @@ func (c *Client) doRequest(ctx context.Context, operation, method, url string, b
 		Operation:  operation,
 		StatusCode: resp.StatusCode,
 		Body:       strings.TrimSpace(string(data)),
+		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
 	}
 }
 
-func sleepBeforeRetry(ctx context.Context) error {
-	timer := time.NewTimer(upstreamRetryBackoff)
+func sleepBeforeRetry(ctx context.Context, backoff time.Duration) error {
+	timer := time.NewTimer(backoff)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():

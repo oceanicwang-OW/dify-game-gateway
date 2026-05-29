@@ -29,6 +29,9 @@ type UploadFileReq struct {
 	User     string
 	Filename string
 	Reader   io.Reader
+	// ContentType is the MIME type for the file part. If empty it is inferred
+	// from the filename extension (see fileContentType).
+	ContentType string
 }
 
 type UploadFileResult struct {
