@@ -189,6 +189,121 @@ func TestCircuitOpensOnHighErrorRateThenHalfOpenSuccessCloses(t *testing.T) {
 	mustAllow(t, l, "player-7", 0)
 }
 
+func TestRecordWithNegativeTokensStillResolvesHalfOpenProbe(t *testing.T) {
+	l, clock := newTestLimiter(t, Config{
+		RatePerPlayer:       "100r/1m",
+		TokenBudgetDaily:    1000,
+		MaxInflightUpstream: 10,
+		Circuit: CircuitConfig{
+			Window:           2,
+			MinSamples:       2,
+			FailureThreshold: 0.5,
+			OpenDuration:     30 * time.Second,
+		},
+	})
+	ctx := context.Background()
+
+	// Trip the breaker open with two failures.
+	mustAllow(t, l, "player-1", 0)
+	if err := l.RecordFailure(ctx); err != nil {
+		t.Fatalf("RecordFailure() error = %v", err)
+	}
+	mustAllow(t, l, "player-2", 0)
+	if err := l.RecordFailure(ctx); err != nil {
+		t.Fatalf("RecordFailure() error = %v", err)
+	}
+
+	// Move past the open window and consume the single half-open probe.
+	clock.Advance(31 * time.Second)
+	mustAllow(t, l, "player-3", 0)
+
+	// A bad-input Record (negative tokens) must still resolve the probe so the
+	// breaker can recover instead of staying wedged half-open.
+	if err := l.Record(ctx, "player-3", -5); err == nil {
+		t.Fatalf("Record() with negative tokens = nil, want error")
+	}
+
+	mustAllow(t, l, "player-4", 0)
+}
+
+func TestCircuitRecoversWhenProbeIsNeverResolved(t *testing.T) {
+	l, clock := newTestLimiter(t, Config{
+		RatePerPlayer:       "100r/1m",
+		TokenBudgetDaily:    1000,
+		MaxInflightUpstream: 10,
+		Circuit: CircuitConfig{
+			Window:           2,
+			MinSamples:       2,
+			FailureThreshold: 0.5,
+			OpenDuration:     30 * time.Second,
+		},
+	})
+	ctx := context.Background()
+
+	mustAllow(t, l, "player-1", 0)
+	if err := l.RecordFailure(ctx); err != nil {
+		t.Fatalf("RecordFailure() error = %v", err)
+	}
+	mustAllow(t, l, "player-2", 0)
+	if err := l.RecordFailure(ctx); err != nil {
+		t.Fatalf("RecordFailure() error = %v", err)
+	}
+
+	// Admit the half-open probe but never call Record/RecordFailure for it,
+	// simulating a crashed caller.
+	clock.Advance(31 * time.Second)
+	mustAllow(t, l, "player-3", 0)
+
+	// While the probe is in flight a second request is rejected.
+	if ok, err := l.Allow(ctx, "player-4", 0); ok || !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("Allow during probe = (%v, %v), want ErrCircuitOpen", ok, err)
+	}
+
+	// After the probe deadline the breaker must admit a fresh probe instead of
+	// staying wedged forever.
+	clock.Advance(31 * time.Second)
+	mustAllow(t, l, "player-5", 0)
+}
+
+func TestRecordedFailureWhileOpenDoesNotExtendOpenWindow(t *testing.T) {
+	l, clock := newTestLimiter(t, Config{
+		RatePerPlayer:       "100r/1m",
+		TokenBudgetDaily:    1000,
+		MaxInflightUpstream: 10,
+		Circuit: CircuitConfig{
+			Window:           2,
+			MinSamples:       2,
+			FailureThreshold: 0.5,
+			OpenDuration:     30 * time.Second,
+		},
+	})
+	ctx := context.Background()
+
+	// Three calls are admitted before the breaker opens.
+	mustAllow(t, l, "player-1", 0)
+	mustAllow(t, l, "player-2", 0)
+	mustAllow(t, l, "player-3", 0)
+	// Two failures open the breaker at t=0 (window=2, min=2, threshold=0.5).
+	if err := l.RecordFailure(ctx); err != nil {
+		t.Fatalf("RecordFailure() error = %v", err)
+	}
+	if err := l.RecordFailure(ctx); err != nil {
+		t.Fatalf("RecordFailure() error = %v", err)
+	}
+
+	// A straggler failure arrives later while the breaker is already open; it
+	// must not push the recovery deadline forward.
+	clock.Advance(20 * time.Second)
+	if err := l.RecordFailure(ctx); err != nil {
+		t.Fatalf("RecordFailure() error = %v", err)
+	}
+
+	// The open window is timed from when it opened, not extended by the
+	// straggler: 31s after opening the breaker must admit a probe.
+	clock.Advance(11 * time.Second)
+	mustAllow(t, l, "player-3", 0)
+}
+
 func TestRecordFailureReleasesInflightSlot(t *testing.T) {
 	l, _ := newTestLimiter(t, Config{
 		RatePerPlayer:       "100r/1m",

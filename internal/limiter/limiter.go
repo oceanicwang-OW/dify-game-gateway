@@ -5,6 +5,8 @@ package limiter
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -40,23 +42,45 @@ redis.call("PEXPIRE", KEYS[1], ARGV[5])
 return 1
 `)
 
+// acquireInflightScript reserves one upstream slot in a sorted set keyed by a
+// per-holder lease token (score = lease expiry). Expired leases are purged on
+// every acquire so a crashed holder's slot is reclaimed even under sustained
+// traffic. Returns -1 when the limit is reached, otherwise the new live count.
 var acquireInflightScript = redis.NewScript(`
-local current = tonumber(redis.call("GET", KEYS[1]) or "0")
-if current >= tonumber(ARGV[1]) then
-	return 0
+redis.call("ZREMRANGEBYSCORE", KEYS[1], 0, ARGV[1])
+local count = redis.call("ZCARD", KEYS[1])
+if count >= tonumber(ARGV[2]) then
+	return -1
 end
-redis.call("INCR", KEYS[1])
-redis.call("PEXPIRE", KEYS[1], ARGV[2])
-return 1
+redis.call("ZADD", KEYS[1], ARGV[3], ARGV[4])
+redis.call("PEXPIRE", KEYS[1], ARGV[5])
+return count + 1
 `)
 
+// releaseInflightScript purges expired leases, then removes one live slot
+// (slots are fungible, so the oldest lease is dropped) and returns the new
+// live count so callers can publish an authoritative gauge value.
 var releaseInflightScript = redis.NewScript(`
-local current = tonumber(redis.call("GET", KEYS[1]) or "0")
-if current <= 1 then
+redis.call("ZREMRANGEBYSCORE", KEYS[1], 0, ARGV[1])
+local oldest = redis.call("ZRANGE", KEYS[1], 0, 0)
+if oldest[1] then
+	redis.call("ZREM", KEYS[1], oldest[1])
+end
+local count = redis.call("ZCARD", KEYS[1])
+if count <= 0 then
 	redis.call("DEL", KEYS[1])
 	return 0
 end
-return redis.call("DECR", KEYS[1])
+return count
+`)
+
+// recordBudgetScript atomically increments the daily token counter and refreshes
+// its TTL so a crash can never leave the key without an expiry (which would
+// permanently lock a player out once they cross the budget).
+var recordBudgetScript = redis.NewScript(`
+local total = redis.call("INCRBY", KEYS[1], ARGV[1])
+redis.call("PEXPIRE", KEYS[1], ARGV[2])
+return total
 `)
 
 type Config struct {
@@ -87,6 +111,7 @@ type RedisLimiter struct {
 	inflightTTL  time.Duration
 	now          func() time.Time
 	circuit      *circuitBreaker
+	instanceID   string
 	memberSerial atomic.Uint64
 }
 
@@ -129,7 +154,19 @@ func New(client redis.UniversalClient, cfg Config) (*RedisLimiter, error) {
 		inflightTTL: cfg.InflightLease,
 		now:         cfg.Now,
 		circuit:     circuit,
+		instanceID:  newInstanceID(),
 	}, nil
+}
+
+// newInstanceID returns a process-unique prefix so sliding-window members and
+// in-flight lease tokens never collide across gateway processes that share the
+// same Redis keys.
+func newInstanceID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(b)
 }
 
 // Allow checks all request guards. A true result reserves one in-flight upstream
@@ -184,13 +221,18 @@ func (l *RedisLimiter) Record(ctx context.Context, playerID string, usedTokens i
 	if playerID == "" {
 		return fmt.Errorf("limiter: player ID is required")
 	}
+	// Release the slot and resolve the circuit probe first, before any
+	// argument validation can short-circuit the function, so a half-open
+	// probe is never stranded by a bad-input return.
+	releaseErr := l.releaseInflight(ctx)
+	l.circuit.record(true)
 	if usedTokens < 0 {
-		_ = l.releaseInflight(ctx)
+		if releaseErr != nil {
+			return releaseErr
+		}
 		return fmt.Errorf("limiter: used tokens cannot be negative")
 	}
-	releaseErr := l.releaseInflight(ctx)
 	recordErr := l.recordTokens(ctx, playerID, usedTokens)
-	l.circuit.record(true)
 	if releaseErr != nil {
 		return releaseErr
 	}
@@ -211,7 +253,7 @@ func (l *RedisLimiter) allowRate(ctx context.Context, playerID string) error {
 	if windowMs < 1 {
 		windowMs = 1
 	}
-	member := strconv.FormatInt(nowMs, 10) + ":" + strconv.FormatUint(l.memberSerial.Add(1), 10)
+	member := l.instanceID + ":" + strconv.FormatInt(nowMs, 10) + ":" + strconv.FormatUint(l.memberSerial.Add(1), 10)
 	result, err := rateLimitScript.Run(ctx, l.client, []string{rateKey(playerID)},
 		nowMs,
 		nowMs-windowMs,
@@ -229,9 +271,6 @@ func (l *RedisLimiter) allowRate(ctx context.Context, playerID string) error {
 }
 
 func (l *RedisLimiter) checkBudget(ctx context.Context, playerID string, estTokens int) error {
-	if estTokens == 0 {
-		return nil
-	}
 	current, err := l.currentBudget(ctx, playerID)
 	if err != nil {
 		return err
@@ -262,39 +301,51 @@ func (l *RedisLimiter) recordTokens(ctx context.Context, playerID string, usedTo
 		return nil
 	}
 	key := budgetKey(playerID, l.now())
-	if err := l.client.IncrBy(ctx, key, int64(usedTokens)).Err(); err != nil {
-		return fmt.Errorf("limiter: record token budget: %w", err)
+	ttlMs := durationUntilNextUTCDay(l.now()).Milliseconds()
+	if ttlMs < 1 {
+		ttlMs = 1
 	}
-	if err := l.client.Expire(ctx, key, durationUntilNextUTCDay(l.now())).Err(); err != nil {
-		return fmt.Errorf("limiter: expire token budget: %w", err)
+	if err := recordBudgetScript.Run(ctx, l.client, []string{key},
+		int64(usedTokens),
+		ttlMs,
+	).Err(); err != nil {
+		return fmt.Errorf("limiter: record token budget: %w", err)
 	}
 	return nil
 }
 
 func (l *RedisLimiter) acquireInflight(ctx context.Context) error {
+	nowMs := l.now().UnixMilli()
 	leaseMs := l.inflightTTL.Milliseconds()
 	if leaseMs < 1 {
 		leaseMs = 1
 	}
+	token := l.instanceID + ":" + strconv.FormatInt(nowMs, 10) + ":" + strconv.FormatUint(l.memberSerial.Add(1), 10)
 	result, err := acquireInflightScript.Run(ctx, l.client, []string{inflightKey()},
+		nowMs,
 		l.maxInflight,
+		nowMs+leaseMs,
+		token,
 		leaseMs,
 	).Int()
 	if err != nil {
 		return fmt.Errorf("limiter: acquire inflight slot: %w", err)
 	}
-	if result == 0 {
+	if result < 0 {
 		return ErrInflightFull
 	}
-	telemetry.InflightUpstream.Inc()
+	telemetry.InflightUpstream.Set(float64(result))
 	return nil
 }
 
 func (l *RedisLimiter) releaseInflight(ctx context.Context) error {
-	if err := releaseInflightScript.Run(ctx, l.client, []string{inflightKey()}).Err(); err != nil {
+	result, err := releaseInflightScript.Run(ctx, l.client, []string{inflightKey()},
+		l.now().UnixMilli(),
+	).Int()
+	if err != nil {
 		return fmt.Errorf("limiter: release inflight slot: %w", err)
 	}
-	telemetry.InflightUpstream.Dec()
+	telemetry.InflightUpstream.Set(float64(result))
 	return nil
 }
 

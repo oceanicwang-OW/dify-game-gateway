@@ -36,10 +36,11 @@ type circuitBreaker struct {
 	mu          sync.Mutex
 	now         func() time.Time
 	cfg         CircuitConfig
-	state       CircuitState
-	openedAt    time.Time
-	probeActive bool
-	events      []bool // true=success, false=failure
+	state          CircuitState
+	openedAt       time.Time
+	probeActive    bool
+	probeStartedAt time.Time
+	events         []bool // true=success, false=failure
 }
 
 func newCircuitBreaker(cfg CircuitConfig, now func() time.Time) (*circuitBreaker, error) {
@@ -87,7 +88,10 @@ func (c *circuitBreaker) ready() bool {
 	case CircuitOpen:
 		return c.now().Sub(c.openedAt) >= c.cfg.OpenDuration
 	case CircuitHalfOpen:
-		return !c.probeActive
+		// A probe that is never resolved (caller crash, dropped request)
+		// must not wedge the breaker; treat it as expired after OpenDuration
+		// so a fresh probe can be admitted.
+		return !c.probeActive || c.now().Sub(c.probeStartedAt) >= c.cfg.OpenDuration
 	default:
 		return false
 	}
@@ -109,14 +113,15 @@ func (c *circuitBreaker) allow() bool {
 		telemetry.CircuitState.Set(float64(CircuitHalfOpen))
 	}
 
-	if c.state == CircuitHalfOpen {
-		if c.probeActive {
-			return false
-		}
-		c.probeActive = true
-		return true
+	// State is HalfOpen here (Closed returned above, Open either returned or
+	// transitioned). Admit a single probe, re-admitting one if the previous
+	// probe was never resolved within OpenDuration.
+	if c.probeActive && c.now().Sub(c.probeStartedAt) < c.cfg.OpenDuration {
+		return false
 	}
-	return false
+	c.probeActive = true
+	c.probeStartedAt = c.now()
+	return true
 }
 
 func (c *circuitBreaker) cancelProbe() {
@@ -157,9 +162,9 @@ func (c *circuitBreaker) record(success bool) {
 			c.openLocked()
 		}
 	case CircuitOpen:
-		if !success {
-			c.openedAt = c.now()
-		}
+		// Late-arriving results for calls admitted before the breaker opened
+		// are ignored: the open window is timed from openedAt and must not be
+		// pushed forward by stragglers, or the breaker could never recover.
 	}
 }
 
