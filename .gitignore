@@ -11,3 +11,6 @@
 !.env.example
 .vscode/
 .idea/
+
+# Claude Code local settings (machine-local agent permissions)
+.claude/
