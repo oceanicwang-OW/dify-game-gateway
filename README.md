@@ -4,7 +4,7 @@
 
 Dify 游戏 AI 网关是位于游戏客户端和 Dify 之间的 Go 服务层。它用于把 Dify App API Key 保留在服务端，将游戏请求转换为 Dify API 调用，把模型输出流式返回给游戏客户端，并为鉴权、限流、内容审核、可观测性和会话管理提供基础。
 
-本仓库仍处于里程碑开发阶段。当前已实现的范围包括项目骨架、配置加载、可观测性基座、Dify client 包、Protobuf 协议与分帧编解码、TCP 接入层、JWT 鉴权、Redis 会话存储、上下文装配、限流/配额/熔断，以及内容审核。
+本仓库仍处于里程碑开发阶段。当前已实现的范围包括项目骨架、配置加载、可观测性基座、Dify client 包、Protobuf 协议与分帧编解码、TCP 接入层、JWT 鉴权、Redis 会话存储、上下文装配、限流/配额/熔断、内容审核，以及对话主链路编排。
 
 ### 功能特性
 
@@ -25,8 +25,9 @@ Dify 游戏 AI 网关是位于游戏客户端和 Dify 之间的 Go 服务层。�
 - 上下文装配：从可信 provider 组装 Dify `inputs`，仅允许变量契约内的键，来源失败时降级为部分上下文（`internal/context`）。
 - 限流/配额/熔断：Redis 滑动窗口单玩家限流、每日 token 预算、全局在途上游信号量，以及熔断状态指标（`internal/limiter`）。
 - 内容审核：输入审核与流式输出句级缓冲审核，支持跨 chunk 敏感内容阻断（`internal/moderation`）。
+- 对话主链路编排：串起鉴权、限流、会话映射、上下文装配、输入审核、Dify 流式、输出审核、客户端回写和 token 记账（`internal/pipeline`）。
 
-尚未实现：完整端到端网关编排（主链路与 Stop/Reset 对接）。
+尚未实现：Stop/Reset 对接，以及 M5 联调、压测、安全加固和部署文档。
 
 ### 目录结构
 
@@ -44,6 +45,7 @@ internal/store/       Redis 会话映射与会话创建锁
 internal/limiter/     限流、配额与熔断
 internal/context/     玩家上下文拉取与 inputs 装配
 internal/moderation/  输入与流式输出审核
+internal/pipeline/    对话主链路编排
 internal/telemetry/   指标、JSON 日志和脱敏 helper
 deploy/               部署工作区
 test/                 验证脚本和后续集成测试
@@ -177,10 +179,10 @@ docker run --rm `
 - M3-T2 上下文装配
 - M3-T3 限流/配额/熔断
 - M3-T4 内容审核
+- M4-T1 对话主链路编排
 
 下一个计划里程碑：
 
-- M4-T1 对话主链路编排
 - M4-T2 中止与会话管理对接
 
 ### 安全注意事项
@@ -195,7 +197,7 @@ docker run --rm `
 
 Dify Game AI Gateway is a Go service layer between a game client and Dify. It keeps Dify App API keys on the server side, translates game requests into Dify API calls, streams model output back to the game client, and provides the foundation for auth, rate limiting, moderation, observability, and session management.
 
-This repository is under active milestone development. The implemented surface currently covers the project skeleton, configuration, telemetry, the Dify client package, the Protobuf protocol and frame codec, the TCP access layer, JWT authentication, the Redis session store, context assembly, rate limiting / quota / circuit breaking, and moderation.
+This repository is under active milestone development. The implemented surface currently covers the project skeleton, configuration, telemetry, the Dify client package, the Protobuf protocol and frame codec, the TCP access layer, JWT authentication, the Redis session store, context assembly, rate limiting / quota / circuit breaking, moderation, and main chat pipeline orchestration.
 
 ### Features
 
@@ -216,8 +218,9 @@ This repository is under active milestone development. The implemented surface c
 - Context assembly from trusted providers into Dify `inputs`, admitting only contract keys and degrading to partial context when a source is unavailable (`internal/context`).
 - Rate limiting, quota, and circuit breaking: Redis sliding-window per-player limits, daily token budgets, a global upstream in-flight semaphore, and circuit state metrics (`internal/limiter`).
 - Moderation for input and sentence-buffered streaming output, including detection of blocked content split across chunks (`internal/moderation`).
+- Main chat pipeline orchestration across auth, limiter, session mapping, context assembly, input moderation, Dify streaming, output moderation, client writes, and token accounting (`internal/pipeline`).
 
-Not yet implemented: full end-to-end gateway orchestration (main pipeline and Stop/Reset wiring).
+Not yet implemented: Stop/Reset wiring plus M5 integration tests, load testing, security hardening, and deployment docs.
 
 ### Repository Layout
 
@@ -235,6 +238,7 @@ internal/store/       Redis conversation mapping and creation lock
 internal/limiter/     Rate limiting, quota, and circuit breaking
 internal/context/     Player context fetching and inputs assembly
 internal/moderation/  Input and streaming-output moderation
+internal/pipeline/    Main chat pipeline orchestration
 internal/telemetry/   Metrics, JSON logging, and redaction helpers
 deploy/               Deployment workspace
 test/                 Verification scripts and future integration tests
@@ -368,10 +372,10 @@ Completed milestone scope:
 - M3-T2 context assembler
 - M3-T3 rate limiting / quota / circuit breaker
 - M3-T4 content moderation
+- M4-T1 main chat pipeline orchestration
 
 Next planned milestone:
 
-- M4-T1 main chat pipeline orchestration
 - M4-T2 stop and conversation management wiring
 
 ### Security Notes
