@@ -100,6 +100,7 @@ type rateLimit struct {
 type Limiter interface {
 	Allow(ctx context.Context, playerID string, estTokens int) (bool, error)
 	Record(ctx context.Context, playerID string, usedTokens int) error
+	RecordFailure(ctx context.Context) error
 }
 
 // RedisLimiter implements the PDR §9.1 Limiter contract.

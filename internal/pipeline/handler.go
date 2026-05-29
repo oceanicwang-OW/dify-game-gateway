@@ -26,6 +26,11 @@ import (
 const (
 	defaultConversationTTL     = 24 * time.Hour
 	defaultConversationLockTTL = 15 * time.Second
+	// accountingTimeout bounds the post-stream limiter bookkeeping. It runs on
+	// a context detached from the request so a client disconnect cannot abort
+	// the in-flight slot release, while still capping how long a slow Redis can
+	// hold the handler.
+	accountingTimeout = 5 * time.Second
 )
 
 type DifyClient interface {
@@ -37,10 +42,6 @@ type SessionStore interface {
 	SetConversation(ctx context.Context, playerID, npcID, convID string, ttl time.Duration) error
 	DeleteConversation(ctx context.Context, playerID, npcID string) error
 	AcquireConversationLock(ctx context.Context, playerID, npcID string, ttl time.Duration) (func(), error)
-}
-
-type failureRecorder interface {
-	RecordFailure(ctx context.Context) error
 }
 
 type Config struct {
@@ -108,15 +109,18 @@ func (h *Handler) HandleChat(ctx context.Context, sess *session.Session, req *ga
 
 	if npcID == "" {
 		h.send(send, errorMsg(reqID, "BAD_REQUEST", "npc_id is required"))
+		telemetry.RequestsTotal.WithLabelValues("bad_request").Inc()
 		return
 	}
 	if query == "" {
 		h.send(send, errorMsg(reqID, "BAD_REQUEST", "query is required"))
+		telemetry.RequestsTotal.WithLabelValues("bad_request").Inc()
 		return
 	}
 	if err := h.ready(); err != nil {
 		h.logger.Error("pipeline not ready", "err", err.Error())
 		h.send(send, errorMsg(reqID, "INTERNAL", "gateway is not ready"))
+		telemetry.RequestsTotal.WithLabelValues("error").Inc()
 		return
 	}
 
@@ -125,6 +129,7 @@ func (h *Handler) HandleChat(ctx context.Context, sess *session.Session, req *ga
 			err = limiter.ErrRateLimited
 		}
 		h.send(send, errorMsg(reqID, clientErrorCode(err), clientErrorMessage(err)))
+		telemetry.RequestsTotal.WithLabelValues("rate_limited").Inc()
 		return
 	}
 
@@ -135,6 +140,7 @@ func (h *Handler) HandleChat(ctx context.Context, sess *session.Session, req *ga
 	if err != nil {
 		_ = h.recordSuccess(ctx, playerID, 0)
 		h.send(send, errorMsg(reqID, "INTERNAL", "conversation state unavailable"))
+		telemetry.RequestsTotal.WithLabelValues("error").Inc()
 		return
 	}
 
@@ -142,6 +148,7 @@ func (h *Handler) HandleChat(ctx context.Context, sess *session.Session, req *ga
 	if err != nil {
 		_ = h.recordSuccess(ctx, playerID, 0)
 		h.send(send, errorMsg(reqID, "INTERNAL", "context unavailable"))
+		telemetry.RequestsTotal.WithLabelValues("error").Inc()
 		return
 	}
 
@@ -197,7 +204,7 @@ func (h *Handler) HandleChat(ctx context.Context, sess *session.Session, req *ga
 			_ = h.recordSuccess(ctx, playerID, result.TotalTokens)
 			return
 		}
-		h.recordFailure(ctx, playerID)
+		h.recordFailure(ctx)
 		h.send(send, errorMsg(reqID, clientErrorCode(err), clientErrorMessage(err)))
 		telemetry.RequestsTotal.WithLabelValues("error").Inc()
 		return
@@ -205,6 +212,7 @@ func (h *Handler) HandleChat(ctx context.Context, sess *session.Session, req *ga
 
 	if err := h.recordSuccess(ctx, playerID, result.TotalTokens); err != nil {
 		h.send(send, errorMsg(reqID, "INTERNAL", "usage accounting failed"))
+		telemetry.RequestsTotal.WithLabelValues("error").Inc()
 		return
 	}
 	if result.TotalTokens > 0 {
@@ -213,6 +221,7 @@ func (h *Handler) HandleChat(ctx context.Context, sess *session.Session, req *ga
 	if result.ConversationID != "" {
 		if err := h.store.SetConversation(ctx, playerID, npcID, result.ConversationID, h.conversationTTL); err != nil {
 			h.send(send, errorMsg(reqID, "INTERNAL", "conversation state unavailable"))
+			telemetry.RequestsTotal.WithLabelValues("error").Inc()
 			return
 		}
 	}
@@ -239,8 +248,6 @@ func (h *Handler) ready() error {
 		return fmt.Errorf("store is nil")
 	case h.contextAssembler == nil:
 		return fmt.Errorf("context assembler is nil")
-	case h.moderator == nil:
-		return fmt.Errorf("moderator is nil")
 	case h.dify == nil:
 		return fmt.Errorf("dify client is nil")
 	default:
@@ -256,11 +263,27 @@ func (h *Handler) resolveConversation(ctx context.Context, playerID, npcID, clie
 	if conversationID != "" {
 		return conversationID, nil, nil
 	}
-	if strings.TrimSpace(clientConvID) != "" {
-		return strings.TrimSpace(clientConvID), nil, nil
+	if trimmed := strings.TrimSpace(clientConvID); trimmed != "" {
+		// The client-supplied conversation_id is only a fallback when the
+		// server has no stored mapping. It is NOT trusted for ownership: every
+		// upstream call is scoped to userID(playerID, npcID) (see HandleChat),
+		// so Dify rejects a conversation that belongs to a different user. A
+		// guessed/foreign id therefore cannot leak another player's context.
+		return trimmed, nil, nil
 	}
 
-	unlock, err = h.store.AcquireConversationLock(ctx, playerID, npcID, h.conversationLockTTL)
+	// Hold the creation lock until the new conversation id is persisted. The
+	// lock must outlive the streaming call, so extend its TTL to the request
+	// deadline (the stream cannot exceed it); otherwise a long stream could
+	// outlast the lock and let a concurrent first message create a duplicate
+	// conversation.
+	lockTTL := h.conversationLockTTL
+	if deadline, ok := ctx.Deadline(); ok {
+		if untilDeadline := time.Until(deadline) + time.Second; untilDeadline > lockTTL {
+			lockTTL = untilDeadline
+		}
+	}
+	unlock, err = h.store.AcquireConversationLock(ctx, playerID, npcID, lockTTL)
 	if err != nil {
 		return "", nil, err
 	}
@@ -277,15 +300,17 @@ func (h *Handler) resolveConversation(ctx context.Context, playerID, npcID, clie
 }
 
 func (h *Handler) recordSuccess(ctx context.Context, playerID string, tokens int) error {
-	return h.limiter.Record(ctx, playerID, tokens)
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), accountingTimeout)
+	defer cancel()
+	return h.limiter.Record(actx, playerID, tokens)
 }
 
-func (h *Handler) recordFailure(ctx context.Context, playerID string) {
-	if rec, ok := h.limiter.(failureRecorder); ok {
-		_ = rec.RecordFailure(ctx)
-		return
+func (h *Handler) recordFailure(ctx context.Context) {
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), accountingTimeout)
+	defer cancel()
+	if err := h.limiter.RecordFailure(actx); err != nil {
+		h.logger.Warn("record upstream failure", "err", err.Error())
 	}
-	_ = h.limiter.Record(ctx, playerID, 0)
 }
 
 func (h *Handler) send(send func(*gatewaypb.ServerEnvelope) error, env *gatewaypb.ServerEnvelope) {

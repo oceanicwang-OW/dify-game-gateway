@@ -62,6 +62,7 @@ type fakeStore struct {
 	gets         int
 	sets         []string
 	lockCalls    int
+	lockTTL      time.Duration
 }
 
 func (s *fakeStore) GetConversation(context.Context, string, string) (string, error) {
@@ -77,8 +78,9 @@ func (s *fakeStore) SetConversation(_ context.Context, _ string, _ string, convI
 
 func (s *fakeStore) DeleteConversation(context.Context, string, string) error { return nil }
 
-func (s *fakeStore) AcquireConversationLock(context.Context, string, string, time.Duration) (func(), error) {
+func (s *fakeStore) AcquireConversationLock(_ context.Context, _ string, _ string, ttl time.Duration) (func(), error) {
 	s.lockCalls++
+	s.lockTTL = ttl
 	return func() {}, nil
 }
 
@@ -352,6 +354,58 @@ func TestHandleChatBlocksUnsafeStreamingOutput(t *testing.T) {
 	}
 	if !reflect.DeepEqual(lim.recordCalls, []int{12}) {
 		t.Fatalf("limiter records = %#v, want record final usage", lim.recordCalls)
+	}
+}
+
+func TestHandleChatExtendsCreationLockToRequestDeadline(t *testing.T) {
+	store := &fakeStore{} // empty mapping -> new conversation path takes the lock
+	h := New(Config{
+		Limiter:          &fakeLimiter{},
+		Store:            store,
+		ContextAssembler: fakeAssembler{inputs: map[string]string{}},
+		Moderator:        moderation.AllowAll{},
+		DifyClient:       &fakeDify{result: dify.ChatResult{ConversationID: "conv-new"}},
+	})
+	send, _ := captureSend(t)
+
+	// A deadline well beyond the default 15s lock TTL must widen the lease so
+	// the lock outlives a long stream.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	h.HandleChat(ctx, authedSession("player-1"), &gatewaypb.ChatRequest{
+		RequestId: "req-1",
+		NpcId:     "npc",
+		Query:     "hello",
+	}, send)
+
+	if store.lockCalls != 1 {
+		t.Fatalf("lockCalls = %d, want 1", store.lockCalls)
+	}
+	if store.lockTTL <= defaultConversationLockTTL {
+		t.Fatalf("lockTTL = %s, want > default %s (extended to deadline)", store.lockTTL, defaultConversationLockTTL)
+	}
+}
+
+func TestHandleChatUsesDefaultLockTTLWithoutDeadline(t *testing.T) {
+	store := &fakeStore{}
+	h := New(Config{
+		Limiter:          &fakeLimiter{},
+		Store:            store,
+		ContextAssembler: fakeAssembler{inputs: map[string]string{}},
+		Moderator:        moderation.AllowAll{},
+		DifyClient:       &fakeDify{result: dify.ChatResult{ConversationID: "conv-new"}},
+	})
+	send, _ := captureSend(t)
+
+	h.HandleChat(context.Background(), authedSession("player-1"), &gatewaypb.ChatRequest{
+		RequestId: "req-1",
+		NpcId:     "npc",
+		Query:     "hello",
+	}, send)
+
+	if store.lockTTL != defaultConversationLockTTL {
+		t.Fatalf("lockTTL = %s, want default %s", store.lockTTL, defaultConversationLockTTL)
 	}
 }
 
