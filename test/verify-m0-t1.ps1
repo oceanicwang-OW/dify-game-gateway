@@ -1,28 +1,31 @@
 ﻿$ErrorActionPreference = 'Stop'
 
+# Verify the M0-T1 skeleton directories exist. These started as .gitkeep
+# placeholders; later milestones replace the placeholders with real code, so we
+# assert the directory exists rather than a specific placeholder file.
 $requiredPaths = @(
   'go.mod',
   'Makefile',
   'Dockerfile',
   '.github/workflows/ci.yml',
   'cmd/gateway/main.go',
-  'internal/config/.gitkeep',
-  'internal/listener/.gitkeep',
-  'internal/codec/.gitkeep',
-  'internal/session/.gitkeep',
-  'internal/auth/.gitkeep',
-  'internal/limiter/.gitkeep',
-  'internal/context/.gitkeep',
+  'internal/config',
+  'internal/listener',
+  'internal/codec',
+  'internal/session',
+  'internal/auth',
+  'internal/limiter',
+  'internal/context',
   'internal/dify/client.go',
   'internal/dify/sse.go',
   'internal/dify/types.go',
-  'internal/moderation/.gitkeep',
-  'internal/mux/.gitkeep',
-  'internal/store/.gitkeep',
-  'internal/telemetry/.gitkeep',
+  'internal/moderation',
+  'internal/mux',
+  'internal/store',
+  'internal/telemetry',
   'api/proto/gateway.proto',
-  'deploy/.gitkeep',
-  'test/.gitkeep'
+  'deploy',
+  'test'
 )
 
 $missing = @()
