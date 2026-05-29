@@ -4,7 +4,7 @@
 
 Dify 游戏 AI 网关是位于游戏客户端和 Dify 之间的 Go 服务层。它用于把 Dify App API Key 保留在服务端，将游戏请求转换为 Dify API 调用，把模型输出流式返回给游戏客户端，并为鉴权、限流、内容审核、可观测性和会话管理提供基础。
 
-本仓库仍处于里程碑开发阶段。当前已实现的范围主要包括项目骨架、配置加载、可观测性基座和 Dify client 包。
+本仓库仍处于里程碑开发阶段。当前已实现的范围包括项目骨架、配置加载、可观测性基座、Dify client 包、Protobuf 协议与分帧编解码、TCP 接入层、JWT 鉴权，以及 Redis 会话存储。
 
 ### 功能特性
 
@@ -17,18 +17,28 @@ Dify 游戏 AI 网关是位于游戏客户端和 Dify 之间的 Go 服务层。�
 - Dify 文件上传接口封装：`POST /files/upload`。
 - Dify 应用参数接口封装：`GET /parameters`。
 - 本地 `inputs` 变量契约检查。
-- 上游 HTTP 错误映射与重试：在尚未发出任何流式 delta 前，对 429/5xx 做重试。
+- 上游 HTTP 错误映射与重试：在尚未发出任何流式 delta 前，对 429/5xx 做指数退避重试。
+- Protobuf 客户端协议与 4 字节长度前缀分帧编解码（`api/proto`、`internal/codec`）。
+- TCP 接入层：每连接一 goroutine、心跳、连接级写串行化、按 `request_id` 多路复用（`internal/listener`、`internal/session`、`internal/mux`）。
+- JWT session token 验签与 player 绑定，算法锁定到公钥族，拒绝 `alg=none` 与 HMAC alg-confusion（`internal/auth`）。
+- Redis 会话存储：`conv:{player}:{npc}` 映射的增删查与 TTL，以及首次会话创建的分布式锁（`internal/store`）。
 
-尚未实现：TCP 接入层、Protobuf 编解码、客户端 session 管理、JWT 鉴权、Redis 会话存储、上下文装配、限流器、内容审核和完整端到端网关编排。
+尚未实现：上下文装配、限流器、内容审核，以及完整端到端网关编排（主链路与 Stop/Reset 对接）。
 
 ### 目录结构
 
 ```text
 cmd/gateway/          网关入口
+api/proto/            Protobuf 协议与生成的 Go 代码
 internal/config/      环境变量加载与校验
 internal/dify/        Dify REST 与 SSE client
+internal/codec/       长度前缀分帧与信封编解码
+internal/listener/    TCP 接入层与连接生命周期
+internal/session/     连接会话状态与 player 绑定
+internal/mux/         单连接写串行化与请求多路复用
+internal/auth/        JWT session token 验签
+internal/store/       Redis 会话映射与会话创建锁
 internal/telemetry/   指标、JSON 日志和脱敏 helper
-api/                  后续协议/proto 工作区
 deploy/               部署工作区
 test/                 验证脚本和后续集成测试
 ```
@@ -85,7 +95,7 @@ make build
 make lint
 ```
 
-`make proto` 在 M2 协议里程碑前是占位目标，会输出说明并失败，不会生成代码。
+`make proto` 使用 `protoc` 与 `protoc-gen-go` 从 `api/proto/gateway.proto` 生成 Go 代码；缺少其中任一工具时会给出明确提示并失败。
 
 ### 运行
 
@@ -154,10 +164,16 @@ docker run --rm `
 - M1-T2 Dify SSE 流式解析
 - M1-T3 Stop、文件上传和参数接口
 - M1-T4 上游错误映射与重试
+- M2-T1 Protobuf 协议与分帧编解码
+- M2-T2 TCP 接入层（listener/session/mux）
+- M2-T3 JWT 鉴权
+- M3-T1 Redis 会话存储与会话创建锁
 
 下一个计划里程碑：
 
-- M2-T1 Protobuf 协议与分帧编解码
+- M3-T2 上下文装配
+- M3-T3 限流/配额/熔断
+- M3-T4 内容审核
 
 ### 安全注意事项
 
@@ -171,7 +187,7 @@ docker run --rm `
 
 Dify Game AI Gateway is a Go service layer between a game client and Dify. It keeps Dify App API keys on the server side, translates game requests into Dify API calls, streams model output back to the game client, and provides the foundation for auth, rate limiting, moderation, observability, and session management.
 
-This repository is under active milestone development. The implemented surface currently focuses on the project skeleton, configuration, telemetry, and the Dify client package.
+This repository is under active milestone development. The implemented surface currently covers the project skeleton, configuration, telemetry, the Dify client package, the Protobuf protocol and frame codec, the TCP access layer, JWT authentication, and the Redis session store.
 
 ### Features
 
@@ -184,18 +200,28 @@ This repository is under active milestone development. The implemented surface c
 - Dify file upload wrapper: `POST /files/upload`.
 - Dify app parameter wrapper: `GET /parameters`.
 - Parameter contract checking for local `inputs` variables.
-- Upstream HTTP error mapping and retry handling for 429/5xx before any stream delta is emitted.
+- Upstream HTTP error mapping with exponential-backoff retry for 429/5xx before any stream delta is emitted.
+- Protobuf client protocol with 4-byte length-prefixed frame codec (`api/proto`, `internal/codec`).
+- TCP access layer: one goroutine per connection, heartbeat, connection-level write serialization, and `request_id` multiplexing (`internal/listener`, `internal/session`, `internal/mux`).
+- JWT session-token verification and player binding, with algorithms pinned to the key family and `alg=none`/HMAC alg-confusion rejected (`internal/auth`).
+- Redis session store: `conv:{player}:{npc}` mapping CRUD with TTL plus the distributed lock for first-time conversation creation (`internal/store`).
 
-Not yet implemented: TCP listener, Protobuf codec, client session handling, JWT auth, Redis session store, context assembler, limiter, moderation, and full end-to-end gateway orchestration.
+Not yet implemented: context assembler, limiter, moderation, and full end-to-end gateway orchestration (main pipeline and Stop/Reset wiring).
 
 ### Repository Layout
 
 ```text
 cmd/gateway/          Gateway entrypoint
+api/proto/            Protobuf protocol and generated Go code
 internal/config/      Environment loading and validation
 internal/dify/        Dify REST and SSE client
+internal/codec/       Length-prefixed frame and envelope codec
+internal/listener/    TCP access layer and connection lifecycle
+internal/session/     Connection session state and player binding
+internal/mux/         Single-connection write serialization and request multiplexing
+internal/auth/        JWT session-token verification
+internal/store/       Redis conversation mapping and creation lock
 internal/telemetry/   Metrics, JSON logging, and redaction helpers
-api/                  API/proto workspace for later protocol work
 deploy/               Deployment workspace
 test/                 Verification scripts and future integration tests
 ```
@@ -252,7 +278,7 @@ make build
 make lint
 ```
 
-`make proto` is intentionally a placeholder until the M2 protocol milestone. It fails with an explanatory message instead of generating code.
+`make proto` generates Go code from `api/proto/gateway.proto` using `protoc` and `protoc-gen-go`. It fails with an explanatory message if either tool is missing.
 
 ### Run
 
@@ -321,10 +347,16 @@ Completed milestone scope:
 - M1-T2 Dify SSE streaming parser
 - M1-T3 Stop, file upload, and parameters APIs
 - M1-T4 upstream error mapping and retry behavior
+- M2-T1 Protobuf protocol and frame codec
+- M2-T2 TCP access layer (listener/session/mux)
+- M2-T3 JWT authentication
+- M3-T1 Redis session store and conversation creation lock
 
 Next planned milestone:
 
-- M2-T1 Protobuf protocol and frame codec
+- M3-T2 context assembler
+- M3-T3 rate limiting / quota / circuit breaker
+- M3-T4 content moderation
 
 ### Security Notes
 
