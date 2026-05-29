@@ -168,12 +168,12 @@ docker run --rm `
 - M2-T2 TCP 接入层（listener/session/mux）
 - M2-T3 JWT 鉴权
 - M3-T1 Redis 会话存储与会话创建锁
+- M3-T2 上下文装配
+- M3-T4 内容审核
 
 下一个计划里程碑：
 
-- M3-T2 上下文装配
 - M3-T3 限流/配额/熔断
-- M3-T4 内容审核
 
 ### 安全注意事项
 
@@ -351,12 +351,12 @@ Completed milestone scope:
 - M2-T2 TCP access layer (listener/session/mux)
 - M2-T3 JWT authentication
 - M3-T1 Redis session store and conversation creation lock
+- M3-T2 context assembler
+- M3-T4 content moderation
 
 Next planned milestone:
 
-- M3-T2 context assembler
 - M3-T3 rate limiting / quota / circuit breaker
-- M3-T4 content moderation
 
 ### Security Notes
 
