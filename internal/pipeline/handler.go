@@ -214,14 +214,18 @@ func (h *Handler) HandleChat(ctx context.Context, sess *session.Session, req *ga
 			_ = h.recordSuccess(ctx, playerID, result.TotalTokens)
 			return
 		}
-		if ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
 			// The request context was cancelled by a client StopRequest (or a
-			// disconnect), which aborted the local stream. Ask Dify to stop
-			// generating upstream as well, then close the request cleanly: a
-			// stop is not an upstream failure, so it must not trip the circuit
-			// breaker or surface an error frame.
+			// disconnect), which aborted the local stream — distinct from a
+			// deadline (context.DeadlineExceeded), which is a real upstream
+			// timeout and falls through to the error path below. Ask Dify to
+			// stop generating upstream, persist any conversation it created so
+			// the next message can continue it, and release the slot WITHOUT a
+			// circuit success/failure: a cancel is neither, so it must not skew
+			// the breaker or surface an error frame.
 			h.stopUpstream(taskID, user)
-			_ = h.recordSuccess(ctx, playerID, result.TotalTokens)
+			h.releaseSlot(ctx)
+			h.persistConversation(ctx, playerID, npcID, result.ConversationID)
 			h.send(send, done(reqID, result.ConversationID, result.TotalTokens))
 			telemetry.RequestsTotal.WithLabelValues("stopped").Inc()
 			return
@@ -335,8 +339,37 @@ func (h *Handler) recordFailure(ctx context.Context) {
 	}
 }
 
+// releaseSlot frees the in-flight slot for a cancelled request without recording
+// a circuit success or failure. Runs detached since the request ctx is cancelled.
+func (h *Handler) releaseSlot(ctx context.Context) {
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), accountingTimeout)
+	defer cancel()
+	if err := h.limiter.Release(actx); err != nil {
+		h.logger.Warn("release inflight slot", "err", err.Error())
+	}
+}
+
+// persistConversation stores the conversation mapping on a detached context. It
+// is used on the stop path (the request ctx is cancelled) so a conversation Dify
+// created before the stop is not orphaned and the next message can continue it.
+// Note: this shares the inherent reset/chat race — a concurrent ResetRequest can
+// be undone by a slightly-later persist, same as the normal success path.
+func (h *Handler) persistConversation(ctx context.Context, playerID, npcID, convID string) {
+	if convID == "" {
+		return
+	}
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), accountingTimeout)
+	defer cancel()
+	if err := h.store.SetConversation(actx, playerID, npcID, convID, h.conversationTTL); err != nil {
+		h.logger.Warn("persist conversation after stop", "err", err.Error())
+	}
+}
+
 // stopUpstream best-effort aborts the Dify generation for taskID. The request
 // context is already cancelled here, so it runs on a fresh bounded context.
+// A stop that arrives before Dify's first message event has no taskID yet
+// (PDR M4-T2 only requires stop to work after the first delta); such an early
+// stop aborts the local stream but cannot call the upstream stop API.
 func (h *Handler) stopUpstream(taskID, user string) {
 	if taskID == "" {
 		return // stream never produced a message event; nothing to stop upstream

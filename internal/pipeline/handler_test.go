@@ -35,6 +35,7 @@ type fakeLimiter struct {
 	allowCalls    int
 	recordCalls   []int
 	failureCalls  int
+	releaseCalls  int
 	allowedPlayer string
 }
 
@@ -54,6 +55,11 @@ func (l *fakeLimiter) Record(_ context.Context, _ string, usedTokens int) error 
 
 func (l *fakeLimiter) RecordFailure(context.Context) error {
 	l.failureCalls++
+	return nil
+}
+
+func (l *fakeLimiter) Release(context.Context) error {
+	l.releaseCalls++
 	return nil
 }
 
@@ -440,9 +446,10 @@ func TestHandleChatStopAbortsUpstreamAndIsNotAFailure(t *testing.T) {
 		result:       dify.ChatResult{ConversationID: "conv-x", TotalTokens: 5},
 		beforeReturn: cancel, // a StopRequest cancels the request context mid-stream
 	}
+	store := &fakeStore{} // new conversation; stop should persist the created id
 	h := New(Config{
 		Limiter:          lim,
-		Store:            &fakeStore{conversation: "conv-x"},
+		Store:            store,
 		ContextAssembler: fakeAssembler{inputs: map[string]string{}},
 		Moderator:        moderation.AllowAll{},
 		DifyClient:       difyClient,
@@ -461,12 +468,15 @@ func TestHandleChatStopAbortsUpstreamAndIsNotAFailure(t *testing.T) {
 		t.Fatalf("stop = (%d, %q, %q), want one stop for task-1 / player-1:npc",
 			difyClient.stopCalls, difyClient.stopTaskID, difyClient.stopUser)
 	}
-	// A stop is not an upstream failure: no circuit failure, slot released once.
-	if lim.failureCalls != 0 {
-		t.Fatalf("failureCalls = %d, want 0", lim.failureCalls)
+	// A cancel is neither success nor failure: the slot is released neutrally,
+	// with no circuit success (Record) or failure (RecordFailure).
+	if lim.releaseCalls != 1 || len(lim.recordCalls) != 0 || lim.failureCalls != 0 {
+		t.Fatalf("limiter = (release %d, record %#v, failure %d), want one neutral release only",
+			lim.releaseCalls, lim.recordCalls, lim.failureCalls)
 	}
-	if len(lim.recordCalls) != 1 {
-		t.Fatalf("recordCalls = %#v, want one success record", lim.recordCalls)
+	// The conversation Dify created before the stop is persisted, not orphaned.
+	if !reflect.DeepEqual(store.sets, []string{"conv-x"}) {
+		t.Fatalf("store.sets = %#v, want [conv-x] persisted on stop", store.sets)
 	}
 	// No error frame; a clean done closes the request.
 	for _, e := range *sent {
@@ -476,6 +486,40 @@ func TestHandleChatStopAbortsUpstreamAndIsNotAFailure(t *testing.T) {
 	}
 	if n := len(*sent); n == 0 || (*sent)[n-1].kind != "done" {
 		t.Fatalf("sent = %#v, want trailing done", *sent)
+	}
+}
+
+func TestHandleChatDeadlineIsAFailureNotAStop(t *testing.T) {
+	lim := &fakeLimiter{}
+	// A context that is already past its deadline: ChatStream returns the ctx
+	// error and ctx.Err() == DeadlineExceeded, which must NOT be treated as a
+	// client stop.
+	ctx, cancel := context.WithTimeout(context.Background(), -time.Second)
+	defer cancel()
+	difyClient := &fakeDify{deltas: []string{"Hi"}}
+	h := New(Config{
+		Limiter:          lim,
+		Store:            &fakeStore{conversation: "conv-x"},
+		ContextAssembler: fakeAssembler{inputs: map[string]string{}},
+		Moderator:        moderation.AllowAll{},
+		DifyClient:       difyClient,
+	})
+	send, sent := captureSend(t)
+
+	h.HandleChat(ctx, authedSession("player-1"), &gatewaypb.ChatRequest{
+		RequestId: "req-1",
+		NpcId:     "npc",
+		Query:     "hello",
+	}, send)
+
+	if difyClient.stopCalls != 0 {
+		t.Fatalf("stopCalls = %d, want 0 (a timeout is not a client stop)", difyClient.stopCalls)
+	}
+	if lim.failureCalls != 1 || lim.releaseCalls != 0 {
+		t.Fatalf("limiter = (failure %d, release %d), want one circuit failure", lim.failureCalls, lim.releaseCalls)
+	}
+	if n := len(*sent); n != 1 || (*sent)[0].kind != "error" || (*sent)[0].code != "UPSTREAM_TIMEOUT" {
+		t.Fatalf("sent = %#v, want UPSTREAM_TIMEOUT error", *sent)
 	}
 }
 

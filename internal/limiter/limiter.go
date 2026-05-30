@@ -101,6 +101,11 @@ type Limiter interface {
 	Allow(ctx context.Context, playerID string, estTokens int) (bool, error)
 	Record(ctx context.Context, playerID string, usedTokens int) error
 	RecordFailure(ctx context.Context) error
+	// Release frees the in-flight slot without recording a success or a failure
+	// in the circuit breaker. It is for requests that neither completed nor
+	// failed upstream (e.g. a client Stop or disconnect), so their outcome must
+	// not skew circuit-breaker health.
+	Release(ctx context.Context) error
 }
 
 // RedisLimiter implements the PDR §9.1 Limiter contract.
@@ -246,6 +251,15 @@ func (l *RedisLimiter) RecordFailure(ctx context.Context) error {
 	releaseErr := l.releaseInflight(ctx)
 	l.circuit.record(false)
 	return releaseErr
+}
+
+// Release frees the in-flight slot without feeding the circuit breaker. Used for
+// cancelled requests (client Stop/disconnect) that are neither a success nor an
+// upstream failure. If a half-open probe was in flight, resolving it as neither
+// success nor failure would strand it, so the probe is cancelled here.
+func (l *RedisLimiter) Release(ctx context.Context) error {
+	l.circuit.cancelProbe()
+	return l.releaseInflight(ctx)
 }
 
 func (l *RedisLimiter) allowRate(ctx context.Context, playerID string) error {
