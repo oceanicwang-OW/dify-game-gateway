@@ -12,8 +12,7 @@ package loadtest
 import (
 	"context"
 	"fmt"
-	"io"
-	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"runtime"
@@ -23,55 +22,19 @@ import (
 	"testing"
 	"time"
 
-	gatewaypb "dify_gateway/api/proto"
-
-	"dify_gateway/internal/codec"
 	"dify_gateway/internal/dify"
 	"dify_gateway/internal/difymock"
 	"dify_gateway/internal/listener"
 	"dify_gateway/internal/moderation"
 	"dify_gateway/internal/pipeline"
+	"dify_gateway/internal/testsupport"
 )
 
-// --- minimal stand-ins so the load focuses on the access/stream machinery ---
-
-type stubAuth struct{}
-
-// Verify treats the token as the player id, so each connection is its own player.
-func (stubAuth) Verify(_ context.Context, token string) (string, error) { return token, nil }
-
-type stubLimiter struct{}
-
-func (stubLimiter) Allow(context.Context, string, int) (bool, error) { return true, nil }
-func (stubLimiter) Record(context.Context, string, int) error        { return nil }
-func (stubLimiter) RecordFailure(context.Context) error              { return nil }
-func (stubLimiter) Release(context.Context) error                    { return nil }
-
-// stubStore returns a fixed conversation so chats skip the creation-lock path.
-type stubStore struct{}
-
-func (stubStore) GetConversation(context.Context, string, string) (string, error) {
-	return "conv", nil
-}
-func (stubStore) SetConversation(context.Context, string, string, string, time.Duration) error {
-	return nil
-}
-func (stubStore) DeleteConversation(context.Context, string, string) error { return nil }
-func (stubStore) AcquireConversationLock(context.Context, string, string, time.Duration) (func(), error) {
-	return func() {}, nil
-}
-
-type stubAssembler struct{}
-
-func (stubAssembler) Build(context.Context, string, string) (map[string]string, error) {
-	return map[string]string{}, nil
-}
-
-func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
-
 // buildServer wires the real listener + pipeline against a mock Dify whose chat
-// streams one short sentence then a usage-bearing message_end.
-func buildServer(t *testing.T) (*listener.Server, *difymock.Server) {
+// streams one short sentence then a usage-bearing message_end. It takes a
+// testing.TB so both the test and the benchmark can call it without fabricating
+// a fake *testing.T.
+func buildServer(t testing.TB) (*listener.Server, *difymock.Server) {
 	t.Helper()
 	mock := difymock.New("k")
 	mock.SetChat(difymock.ChatBehavior{Events: []difymock.Event{
@@ -82,23 +45,28 @@ func buildServer(t *testing.T) (*listener.Server, *difymock.Server) {
 	hc := mock.Client()
 	// Disable keep-alives so idle-connection goroutines don't linger and create
 	// false-positive leaks; each request opens and closes its own connection.
-	hc.Transport.(*http.Transport).DisableKeepAlives = true
+	tr, ok := hc.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("mock client transport is %T, want *http.Transport", hc.Transport)
+	}
+	tr.DisableKeepAlives = true
 
 	h := pipeline.New(pipeline.Config{
-		Authenticator:    stubAuth{},
-		Limiter:          stubLimiter{},
-		Store:            stubStore{},
-		ContextAssembler: stubAssembler{},
+		Authenticator:    testsupport.Auth{},
+		Limiter:          testsupport.Limiter{},
+		Store:            testsupport.Store{Conversation: "conv"},
+		ContextAssembler: testsupport.Assembler{},
 		Moderator:        moderation.AllowAll{},
 		DifyClient:       dify.NewClient(mock.URL, "k", hc),
 	})
-	srv := listener.New(h, discardLogger())
+	srv := listener.New(h, testsupport.DiscardLogger())
 	srv.SetIdleTimeout(30 * time.Second)
 	return srv, mock
 }
 
 // runConn opens one connection, authenticates, runs `turns` chat turns, and
-// records each turn's first-token latency. It returns the count of failed turns.
+// records each turn's first-token latency into rec (when rec is non-nil). It
+// returns the count of failed turns.
 func runConn(t *testing.T, ctx context.Context, srv *listener.Server, wg *sync.WaitGroup, player string, turns int, rec *latencyRecorder) int {
 	clientConn, serverConn := net.Pipe()
 	wg.Add(1)
@@ -108,75 +76,29 @@ func runConn(t *testing.T, ctx context.Context, srv *listener.Server, wg *sync.W
 	}()
 	defer clientConn.Close()
 
-	if err := authenticate(clientConn, player); err != nil {
+	if err := testsupport.Authenticate(clientConn, player); err != nil {
 		t.Errorf("auth: %v", err)
 		return turns
 	}
 
 	failed := 0
 	for i := 0; i < turns; i++ {
-		_ = clientConn.SetDeadline(time.Now().Add(5 * time.Second))
 		reqID := fmt.Sprintf("%s-%d", player, i)
 		start := time.Now()
-		if err := codec.WriteEnvelope(clientConn, chatEnvelope(reqID)); err != nil {
+		if err := testsupport.SendChat(clientConn, reqID, "npc", "hello"); err != nil {
 			failed++
 			continue
 		}
-		ok, firstToken := readTurn(clientConn, start)
+		ok, firstToken, sawToken := testsupport.ReadTurn(clientConn, start)
 		if !ok {
 			failed++
 			continue
 		}
-		rec.add(firstToken)
+		if rec != nil && sawToken {
+			rec.add(firstToken)
+		}
 	}
 	return failed
-}
-
-func authenticate(c net.Conn, player string) error {
-	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := codec.WriteEnvelope(c, &gatewaypb.ClientEnvelope{Body: &gatewaypb.ClientEnvelope_Auth{
-		Auth: &gatewaypb.AuthRequest{SessionToken: player, PlayerId: player},
-	}}); err != nil {
-		return err
-	}
-	env, err := codec.ReadServerEnvelope(c)
-	if err != nil {
-		return err
-	}
-	if !env.GetAuthResult().GetOk() {
-		return fmt.Errorf("auth rejected: %s", env.GetAuthResult().GetReason())
-	}
-	return nil
-}
-
-func chatEnvelope(reqID string) *gatewaypb.ClientEnvelope {
-	return &gatewaypb.ClientEnvelope{Body: &gatewaypb.ClientEnvelope_Chat{
-		Chat: &gatewaypb.ChatRequest{RequestId: reqID, NpcId: "npc", Query: "hello"},
-	}}
-}
-
-// readTurn reads frames until a terminal one, returning whether the turn
-// succeeded and the latency to the first ChatChunk.
-func readTurn(c net.Conn, start time.Time) (ok bool, firstToken time.Duration) {
-	for {
-		env, err := codec.ReadServerEnvelope(c)
-		if err != nil {
-			return false, 0
-		}
-		switch body := env.GetBody().(type) {
-		case *gatewaypb.ServerEnvelope_Chunk:
-			if firstToken == 0 {
-				firstToken = time.Since(start)
-			}
-		case *gatewaypb.ServerEnvelope_Done:
-			return true, firstToken
-		case *gatewaypb.ServerEnvelope_Blocked:
-			return true, firstToken
-		case *gatewaypb.ServerEnvelope_Error:
-			_ = body
-			return false, firstToken
-		}
-	}
 }
 
 type latencyRecorder struct {
@@ -190,6 +112,8 @@ func (r *latencyRecorder) add(d time.Duration) {
 	r.mu.Unlock()
 }
 
+// percentile returns the nearest-rank value for p in [0,1] (rank = ceil(p*n)),
+// so high percentiles include the tail (p=1.0 returns the max).
 func (r *latencyRecorder) percentile(p float64) time.Duration {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -198,7 +122,13 @@ func (r *latencyRecorder) percentile(p float64) time.Duration {
 	}
 	sorted := append([]time.Duration(nil), r.data...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-	idx := int(float64(len(sorted)-1) * p)
+	idx := int(math.Ceil(p*float64(len(sorted)))) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
 	return sorted[idx]
 }
 
@@ -220,10 +150,9 @@ func TestLoadConcurrentConversationsNoLeak(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	// Warm up one full connection so lazy goroutines (mock server, transport)
-	// exist before we record the baseline.
-	warm := &latencyRecorder{}
-	runConn(t, ctx, srv, &wg, "warmup", 2, warm)
+	// Warm up one full connection (latencies discarded) so lazy goroutines
+	// (mock server, transport) exist before we record the baseline.
+	runConn(t, ctx, srv, &wg, "warmup", 2, nil)
 	wg.Wait()
 	runtime.GC()
 	baseline := runtime.NumGoroutine()
@@ -268,11 +197,12 @@ func TestLoadConcurrentConversationsNoLeak(t *testing.T) {
 }
 
 // waitForGoroutines polls until the goroutine count drops to <= target or the
-// timeout elapses, returning the final count.
+// timeout elapses, returning the final count. It does not force GC: goroutines
+// finish when their functions return, not on collection, so polling the count
+// is what matters.
 func waitForGoroutines(target int, timeout time.Duration) int {
 	deadline := time.Now().Add(timeout)
 	for {
-		runtime.GC()
 		n := runtime.NumGoroutine()
 		if n <= target || time.Now().After(deadline) {
 			return n
@@ -284,8 +214,7 @@ func waitForGoroutines(target int, timeout time.Duration) int {
 // BenchmarkChatTurn measures one full chat turn (request -> done) through the
 // listener stack, for tracking per-turn latency and allocations over time.
 func BenchmarkChatTurn(b *testing.B) {
-	t := &testing.T{}
-	srv, mock := buildServer(t)
+	srv, mock := buildServer(b)
 	defer mock.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -293,18 +222,17 @@ func BenchmarkChatTurn(b *testing.B) {
 	clientConn, serverConn := net.Pipe()
 	go srv.ServeConn(ctx, serverConn)
 	defer clientConn.Close()
-	if err := authenticate(clientConn, "bench"); err != nil {
+	if err := testsupport.Authenticate(clientConn, "bench"); err != nil {
 		b.Fatalf("auth: %v", err)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = clientConn.SetDeadline(time.Now().Add(5 * time.Second))
 		reqID := fmt.Sprintf("bench-%d", i)
-		if err := codec.WriteEnvelope(clientConn, chatEnvelope(reqID)); err != nil {
+		if err := testsupport.SendChat(clientConn, reqID, "npc", "hello"); err != nil {
 			b.Fatalf("write: %v", err)
 		}
-		if ok, _ := readTurn(clientConn, time.Now()); !ok {
+		if ok, _, _ := testsupport.ReadTurn(clientConn, time.Now()); !ok {
 			b.Fatalf("turn %d failed", i)
 		}
 	}
