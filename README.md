@@ -49,6 +49,7 @@ internal/moderation/  输入与流式输出审核
 internal/pipeline/    对话主链路编排
 internal/difymock/    可编排 SSE 序列的 Dify mock（集成测试用）
 internal/loadtest/    并发压测与泄漏检测（M5-T2）
+internal/testsupport/ 测试共享的 no-op 依赖与客户端协议 helper
 internal/telemetry/   指标、JSON 日志和脱敏 helper
 deploy/               部署工作区
 test/                 验证脚本和后续集成测试
@@ -248,6 +249,7 @@ internal/moderation/  Input and streaming-output moderation
 internal/pipeline/    Main chat pipeline orchestration
 internal/difymock/    Scriptable SSE Dify mock (integration tests)
 internal/loadtest/    Concurrent load test and leak detection (M5-T2)
+internal/testsupport/ Shared no-op test deps and client-protocol helpers
 internal/telemetry/   Metrics, JSON logging, and redaction helpers
 deploy/               Deployment workspace
 test/                 Verification scripts and future integration tests
