@@ -39,6 +39,10 @@ type Handler interface {
 	// ServerEnvelopes via send. ctx is cancelled when the request is stopped or
 	// the connection closes; the implementation must return promptly on ctx.Done.
 	HandleChat(ctx context.Context, sess *session.Session, req *gatewaypb.ChatRequest, send func(*gatewaypb.ServerEnvelope) error)
+
+	// HandleReset clears the conversation mapping for the request's npc so the
+	// next chat starts a fresh conversation, and acks via send.
+	HandleReset(ctx context.Context, sess *session.Session, req *gatewaypb.ResetRequest, send func(*gatewaypb.ServerEnvelope) error)
 }
 
 // Server accepts client connections and serves them with the access protocol.
@@ -148,6 +152,9 @@ func (s *Server) dispatch(ctx context.Context, sess *session.Session, writer *mu
 	case *gatewaypb.ClientEnvelope_Chat:
 		s.handleChat(ctx, sess, writer, registry, body.Chat)
 
+	case *gatewaypb.ClientEnvelope_Reset_:
+		s.handleReset(ctx, sess, writer, body.Reset_)
+
 	default:
 		// Unknown/empty body: ignore to stay forward-compatible with new frames.
 	}
@@ -176,6 +183,21 @@ func (s *Server) handleChat(ctx context.Context, sess *session.Session, writer *
 		defer done()
 		s.handler.HandleChat(reqCtx, sess, req, writer.Send)
 	}()
+}
+
+func (s *Server) handleReset(ctx context.Context, sess *session.Session, writer *mux.ConnWriter, req *gatewaypb.ResetRequest) {
+	reqID := req.GetRequestId()
+	if reqID == "" {
+		_ = writer.Send(errorMsg("", "BAD_REQUEST", "request_id is required"))
+		return
+	}
+	if !sess.Authenticated() {
+		_ = writer.Send(errorMsg(reqID, "UNAUTHENTICATED", "authenticate before resetting"))
+		return
+	}
+	// Reset is a fast state mutation (delete one mapping key); run it inline like
+	// Auth rather than registering it as an in-flight request.
+	s.handler.HandleReset(ctx, sess, req, writer.Send)
 }
 
 func (s *Server) logReadExit(connID string, err error) {

@@ -35,6 +35,10 @@ const (
 
 type DifyClient interface {
 	ChatStream(ctx context.Context, req dify.ChatReq, onEvent func(taskID, convID string), onDelta func(delta string)) (dify.ChatResult, error)
+	// Stop aborts an in-flight streaming generation upstream so Dify stops
+	// producing (and billing) tokens; dropping the local connection alone does
+	// not guarantee that. taskID comes from the ChatStream onEvent callback.
+	Stop(ctx context.Context, taskID, user string) error
 }
 
 type SessionStore interface {
@@ -163,6 +167,12 @@ func (h *Handler) HandleChat(ctx context.Context, sess *session.Session, req *ga
 	firstDelta := true
 	filter := moderation.NewOutputFilter(h.moderator)
 	outputBlocked := false
+	user := userID(playerID, npcID)
+	// taskID is captured from the first Dify message event so a StopRequest can
+	// abort the generation upstream while the stream is still active. onEvent and
+	// onDelta run synchronously on this goroutine, so a plain assignment is safe.
+	var taskID string
+	onEvent := func(tid, _ string) { taskID = tid }
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
 	onDelta := func(delta string) {
@@ -189,9 +199,9 @@ func (h *Handler) HandleChat(ctx context.Context, sess *session.Session, req *ga
 	result, err := h.dify.ChatStream(streamCtx, dify.ChatReq{
 		Query:          query,
 		Inputs:         inputs,
-		User:           userID(playerID, npcID),
+		User:           user,
 		ConversationID: conversationID,
-	}, nil, onDelta)
+	}, onEvent, onDelta)
 	telemetry.UpstreamLatencySeconds.Observe(time.Since(start).Seconds())
 	if err != nil {
 		if replace, ok := messageReplace(err); ok {
@@ -202,6 +212,18 @@ func (h *Handler) HandleChat(ctx context.Context, sess *session.Session, req *ga
 		}
 		if outputBlocked {
 			_ = h.recordSuccess(ctx, playerID, result.TotalTokens)
+			return
+		}
+		if ctx.Err() != nil {
+			// The request context was cancelled by a client StopRequest (or a
+			// disconnect), which aborted the local stream. Ask Dify to stop
+			// generating upstream as well, then close the request cleanly: a
+			// stop is not an upstream failure, so it must not trip the circuit
+			// breaker or surface an error frame.
+			h.stopUpstream(taskID, user)
+			_ = h.recordSuccess(ctx, playerID, result.TotalTokens)
+			h.send(send, done(reqID, result.ConversationID, result.TotalTokens))
+			telemetry.RequestsTotal.WithLabelValues("stopped").Inc()
 			return
 		}
 		h.recordFailure(ctx)
@@ -311,6 +333,45 @@ func (h *Handler) recordFailure(ctx context.Context) {
 	if err := h.limiter.RecordFailure(actx); err != nil {
 		h.logger.Warn("record upstream failure", "err", err.Error())
 	}
+}
+
+// stopUpstream best-effort aborts the Dify generation for taskID. The request
+// context is already cancelled here, so it runs on a fresh bounded context.
+func (h *Handler) stopUpstream(taskID, user string) {
+	if taskID == "" {
+		return // stream never produced a message event; nothing to stop upstream
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), accountingTimeout)
+	defer cancel()
+	if err := h.dify.Stop(ctx, taskID, user); err != nil {
+		h.logger.Warn("stop upstream generation", "task_id", taskID, "err", err.Error())
+	}
+}
+
+// HandleReset clears the gateway-managed conversation mapping for (player, npc)
+// so the next chat starts a fresh Dify conversation (PDR §M4-T2 reset). It acks
+// with a ChatDone (conversation_id empty, total_tokens 0) on success.
+func (h *Handler) HandleReset(ctx context.Context, sess *session.Session, req *gatewaypb.ResetRequest, send func(*gatewaypb.ServerEnvelope) error) {
+	reqID := req.GetRequestId()
+	npcID := strings.TrimSpace(req.GetNpcId())
+	if npcID == "" {
+		h.send(send, errorMsg(reqID, "BAD_REQUEST", "npc_id is required"))
+		telemetry.RequestsTotal.WithLabelValues("bad_request").Inc()
+		return
+	}
+	if h.store == nil {
+		h.send(send, errorMsg(reqID, "INTERNAL", "gateway is not ready"))
+		telemetry.RequestsTotal.WithLabelValues("error").Inc()
+		return
+	}
+	if err := h.store.DeleteConversation(ctx, sess.PlayerID(), npcID); err != nil {
+		h.logger.Warn("reset conversation", "err", err.Error())
+		h.send(send, errorMsg(reqID, "INTERNAL", "conversation reset failed"))
+		telemetry.RequestsTotal.WithLabelValues("error").Inc()
+		return
+	}
+	h.send(send, done(reqID, "", 0))
+	telemetry.RequestsTotal.WithLabelValues("ok").Inc()
 }
 
 func (h *Handler) send(send func(*gatewaypb.ServerEnvelope) error, env *gatewaypb.ServerEnvelope) {

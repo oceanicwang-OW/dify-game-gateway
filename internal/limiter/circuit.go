@@ -33,9 +33,9 @@ type CircuitConfig struct {
 }
 
 type circuitBreaker struct {
-	mu          sync.Mutex
-	now         func() time.Time
-	cfg         CircuitConfig
+	mu             sync.Mutex
+	now            func() time.Time
+	cfg            CircuitConfig
 	state          CircuitState
 	openedAt       time.Time
 	probeActive    bool

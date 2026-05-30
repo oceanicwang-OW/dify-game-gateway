@@ -22,6 +22,7 @@ type testHandler struct {
 	chunksPerReq int
 	stepDelay    time.Duration
 	blockChat    bool // if true, HandleChat blocks until ctx is cancelled
+	resetNpcs    []string
 }
 
 func (h *testHandler) Authenticate(_ context.Context, sess *session.Session, req *gatewaypb.AuthRequest) (bool, string) {
@@ -53,6 +54,13 @@ func (h *testHandler) HandleChat(ctx context.Context, _ *session.Session, req *g
 	}
 	_ = send(&gatewaypb.ServerEnvelope{Body: &gatewaypb.ServerEnvelope_Done{
 		Done: &gatewaypb.ChatDone{RequestId: reqID, ConversationId: "conv-" + reqID},
+	}})
+}
+
+func (h *testHandler) HandleReset(_ context.Context, _ *session.Session, req *gatewaypb.ResetRequest, send func(*gatewaypb.ServerEnvelope) error) {
+	h.resetNpcs = append(h.resetNpcs, req.GetNpcId())
+	_ = send(&gatewaypb.ServerEnvelope{Body: &gatewaypb.ServerEnvelope_Done{
+		Done: &gatewaypb.ChatDone{RequestId: req.GetRequestId()},
 	}})
 }
 
@@ -218,6 +226,52 @@ func TestChatBeforeAuthRejected(t *testing.T) {
 	em := env.GetError()
 	if em == nil || em.GetCode() != "UNAUTHENTICATED" {
 		t.Fatalf("expected UNAUTHENTICATED error, got %#v", env.GetBody())
+	}
+	client.Close()
+	waitClosed(t, served)
+}
+
+func TestResetBeforeAuthRejected(t *testing.T) {
+	client, served, cancel := newServed(t, &testHandler{})
+	defer cancel()
+
+	if err := codec.WriteEnvelope(client, &gatewaypb.ClientEnvelope{Body: &gatewaypb.ClientEnvelope_Reset_{
+		Reset_: &gatewaypb.ResetRequest{RequestId: "req-1", NpcId: "npc"},
+	}}); err != nil {
+		t.Fatalf("write reset: %v", err)
+	}
+	env, err := codec.ReadServerEnvelope(client)
+	if err != nil {
+		t.Fatalf("read error msg: %v", err)
+	}
+	if em := env.GetError(); em == nil || em.GetCode() != "UNAUTHENTICATED" {
+		t.Fatalf("expected UNAUTHENTICATED error, got %#v", env.GetBody())
+	}
+	client.Close()
+	waitClosed(t, served)
+}
+
+func TestResetDispatchedToHandlerAfterAuth(t *testing.T) {
+	h := &testHandler{}
+	client, served, cancel := newServed(t, h)
+	defer cancel()
+
+	authenticate(t, client)
+
+	if err := codec.WriteEnvelope(client, &gatewaypb.ClientEnvelope{Body: &gatewaypb.ClientEnvelope_Reset_{
+		Reset_: &gatewaypb.ResetRequest{RequestId: "req-1", NpcId: "npc-7"},
+	}}); err != nil {
+		t.Fatalf("write reset: %v", err)
+	}
+	env, err := codec.ReadServerEnvelope(client)
+	if err != nil {
+		t.Fatalf("read reset ack: %v", err)
+	}
+	if done := env.GetDone(); done == nil || done.GetRequestId() != "req-1" {
+		t.Fatalf("expected done ack for req-1, got %#v", env.GetBody())
+	}
+	if len(h.resetNpcs) != 1 || h.resetNpcs[0] != "npc-7" {
+		t.Fatalf("resetNpcs = %#v, want [npc-7]", h.resetNpcs)
 	}
 	client.Close()
 	waitClosed(t, served)

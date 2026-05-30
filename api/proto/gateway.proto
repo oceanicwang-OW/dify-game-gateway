@@ -7,10 +7,11 @@ option go_package = "dify_gateway/api/proto;gatewaypb";
 // 客户端 -> 网关
 message ClientEnvelope {
   oneof body {
-    AuthRequest auth = 1;
-    ChatRequest chat = 2;
-    StopRequest stop = 3;
-    Ping        ping = 4;
+    AuthRequest  auth  = 1;
+    ChatRequest  chat  = 2;
+    StopRequest  stop  = 3;
+    Ping         ping  = 4;
+    ResetRequest reset = 5;
   }
 }
 
@@ -28,6 +29,8 @@ message ChatRequest {
 }
 
 message StopRequest { string request_id = 1; } // 中止生成
+// 会话重置：删除网关托管的 conv:{player}:{npc} 映射，使下一条消息开启新会话。
+message ResetRequest { string request_id = 1; string npc_id = 2; }
 message Ping {}
 
 // 网关 -> 客户端

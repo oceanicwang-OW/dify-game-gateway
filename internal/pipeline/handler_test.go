@@ -63,6 +63,7 @@ type fakeStore struct {
 	sets         []string
 	lockCalls    int
 	lockTTL      time.Duration
+	deletes      int
 }
 
 func (s *fakeStore) GetConversation(context.Context, string, string) (string, error) {
@@ -76,7 +77,11 @@ func (s *fakeStore) SetConversation(_ context.Context, _ string, _ string, convI
 	return nil
 }
 
-func (s *fakeStore) DeleteConversation(context.Context, string, string) error { return nil }
+func (s *fakeStore) DeleteConversation(context.Context, string, string) error {
+	s.deletes++
+	s.conversation = ""
+	return nil
+}
 
 func (s *fakeStore) AcquireConversationLock(_ context.Context, _ string, _ string, ttl time.Duration) (func(), error) {
 	s.lockCalls++
@@ -97,14 +102,18 @@ func (a fakeAssembler) Build(context.Context, string, string) (map[string]string
 }
 
 type fakeDify struct {
-	req       dify.ChatReq
-	deltas    []string
-	result    dify.ChatResult
-	err       error
-	callCount int
+	req          dify.ChatReq
+	deltas       []string
+	result       dify.ChatResult
+	err          error
+	callCount    int
+	beforeReturn func() // invoked after deltas, before returning (e.g. to cancel ctx)
+	stopCalls    int
+	stopTaskID   string
+	stopUser     string
 }
 
-func (d *fakeDify) ChatStream(_ context.Context, req dify.ChatReq, onEvent func(taskID, convID string), onDelta func(delta string)) (dify.ChatResult, error) {
+func (d *fakeDify) ChatStream(ctx context.Context, req dify.ChatReq, onEvent func(taskID, convID string), onDelta func(delta string)) (dify.ChatResult, error) {
 	d.callCount++
 	d.req = req
 	if onEvent != nil {
@@ -115,7 +124,20 @@ func (d *fakeDify) ChatStream(_ context.Context, req dify.ChatReq, onEvent func(
 			onDelta(delta)
 		}
 	}
+	if d.beforeReturn != nil {
+		d.beforeReturn()
+	}
+	if err := ctx.Err(); err != nil {
+		return d.result, err
+	}
 	return d.result, d.err
+}
+
+func (d *fakeDify) Stop(_ context.Context, taskID, user string) error {
+	d.stopCalls++
+	d.stopTaskID = taskID
+	d.stopUser = user
+	return nil
 }
 
 type sentEnvelope struct {
@@ -406,6 +428,105 @@ func TestHandleChatUsesDefaultLockTTLWithoutDeadline(t *testing.T) {
 
 	if store.lockTTL != defaultConversationLockTTL {
 		t.Fatalf("lockTTL = %s, want default %s", store.lockTTL, defaultConversationLockTTL)
+	}
+}
+
+func TestHandleChatStopAbortsUpstreamAndIsNotAFailure(t *testing.T) {
+	lim := &fakeLimiter{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	difyClient := &fakeDify{
+		deltas:       []string{"Hel"},
+		result:       dify.ChatResult{ConversationID: "conv-x", TotalTokens: 5},
+		beforeReturn: cancel, // a StopRequest cancels the request context mid-stream
+	}
+	h := New(Config{
+		Limiter:          lim,
+		Store:            &fakeStore{conversation: "conv-x"},
+		ContextAssembler: fakeAssembler{inputs: map[string]string{}},
+		Moderator:        moderation.AllowAll{},
+		DifyClient:       difyClient,
+	})
+	send, sent := captureSend(t)
+
+	h.HandleChat(ctx, authedSession("player-1"), &gatewaypb.ChatRequest{
+		RequestId: "req-1",
+		NpcId:     "npc",
+		Query:     "hello",
+	}, send)
+
+	// The cached task_id (from onEvent) is used to stop the upstream generation
+	// with the same scoped user.
+	if difyClient.stopCalls != 1 || difyClient.stopTaskID != "task-1" || difyClient.stopUser != "player-1:npc" {
+		t.Fatalf("stop = (%d, %q, %q), want one stop for task-1 / player-1:npc",
+			difyClient.stopCalls, difyClient.stopTaskID, difyClient.stopUser)
+	}
+	// A stop is not an upstream failure: no circuit failure, slot released once.
+	if lim.failureCalls != 0 {
+		t.Fatalf("failureCalls = %d, want 0", lim.failureCalls)
+	}
+	if len(lim.recordCalls) != 1 {
+		t.Fatalf("recordCalls = %#v, want one success record", lim.recordCalls)
+	}
+	// No error frame; a clean done closes the request.
+	for _, e := range *sent {
+		if e.kind == "error" {
+			t.Fatalf("unexpected error frame on stop: %#v", *sent)
+		}
+	}
+	if n := len(*sent); n == 0 || (*sent)[n-1].kind != "done" {
+		t.Fatalf("sent = %#v, want trailing done", *sent)
+	}
+}
+
+func TestHandleResetClearsMappingSoNextChatIsNewConversation(t *testing.T) {
+	store := &fakeStore{conversation: "conv-existing"}
+	h := New(Config{
+		Limiter:          &fakeLimiter{},
+		Store:            store,
+		ContextAssembler: fakeAssembler{inputs: map[string]string{}},
+		Moderator:        moderation.AllowAll{},
+		DifyClient:       &fakeDify{result: dify.ChatResult{ConversationID: "conv-new"}},
+	})
+	send, sent := captureSend(t)
+
+	h.HandleReset(context.Background(), authedSession("player-1"), &gatewaypb.ResetRequest{
+		RequestId: "req-1",
+		NpcId:     "npc",
+	}, send)
+
+	if store.deletes != 1 {
+		t.Fatalf("deletes = %d, want 1", store.deletes)
+	}
+	want := []sentEnvelope{{kind: "done", id: "req-1"}}
+	if !reflect.DeepEqual(*sent, want) {
+		t.Fatalf("reset ack = %#v, want %#v", *sent, want)
+	}
+
+	// The next chat must take the creation lock (mapping was cleared).
+	send2, _ := captureSend(t)
+	h.HandleChat(context.Background(), authedSession("player-1"), &gatewaypb.ChatRequest{
+		RequestId: "req-2",
+		NpcId:     "npc",
+		Query:     "hello again",
+	}, send2)
+	if store.lockCalls != 1 {
+		t.Fatalf("lockCalls = %d after reset, want 1 (new conversation)", store.lockCalls)
+	}
+}
+
+func TestHandleResetRequiresNpcID(t *testing.T) {
+	store := &fakeStore{}
+	h := New(Config{Limiter: &fakeLimiter{}, Store: store, DifyClient: &fakeDify{}})
+	send, sent := captureSend(t)
+
+	h.HandleReset(context.Background(), authedSession("player-1"), &gatewaypb.ResetRequest{RequestId: "req-1"}, send)
+
+	if store.deletes != 0 {
+		t.Fatalf("deletes = %d, want 0 when npc_id missing", store.deletes)
+	}
+	if len(*sent) != 1 || (*sent)[0].kind != "error" || (*sent)[0].code != "BAD_REQUEST" {
+		t.Fatalf("sent = %#v, want BAD_REQUEST error", *sent)
 	}
 }
 
