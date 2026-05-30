@@ -48,6 +48,7 @@ internal/context/     玩家上下文拉取与 inputs 装配
 internal/moderation/  输入与流式输出审核
 internal/pipeline/    对话主链路编排
 internal/difymock/    可编排 SSE 序列的 Dify mock（集成测试用）
+internal/loadtest/    并发压测与泄漏检测（M5-T2）
 internal/telemetry/   指标、JSON 日志和脱敏 helper
 deploy/               部署工作区
 test/                 验证脚本和后续集成测试
@@ -184,10 +185,11 @@ docker run --rm `
 - M4-T1 对话主链路编排
 - M4-T2 中止与会话管理对接
 - M5-T1 Mock Dify 与集成测试
+- M5-T2 压测与稳定性
 
 下一个计划里程碑：
 
-- M5-T2 压测与稳定性
+- M5-T3 安全加固审查
 
 ### 安全注意事项
 
@@ -245,6 +247,7 @@ internal/context/     Player context fetching and inputs assembly
 internal/moderation/  Input and streaming-output moderation
 internal/pipeline/    Main chat pipeline orchestration
 internal/difymock/    Scriptable SSE Dify mock (integration tests)
+internal/loadtest/    Concurrent load test and leak detection (M5-T2)
 internal/telemetry/   Metrics, JSON logging, and redaction helpers
 deploy/               Deployment workspace
 test/                 Verification scripts and future integration tests
@@ -381,10 +384,11 @@ Completed milestone scope:
 - M4-T1 main chat pipeline orchestration
 - M4-T2 stop and conversation management wiring
 - M5-T1 mock Dify and integration tests
+- M5-T2 load testing and stability
 
 Next planned milestone:
 
-- M5-T2 load testing and stability
+- M5-T3 security hardening review
 
 ### Security Notes
 
