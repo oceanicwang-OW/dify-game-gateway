@@ -24,6 +24,18 @@ var (
 	upstreamRetryMaxBackoff  = 5 * time.Second
 )
 
+// SetRetryBackoffForTest overrides the retry backoff durations and returns a
+// function that restores the previous values. It lets tests in other packages
+// that exercise the client end to end (e.g. the pipeline integration suite)
+// avoid sleeping on the production backoff. Test-only.
+func SetRetryBackoffForTest(base, max time.Duration) func() {
+	prevBase, prevMax := upstreamRetryBaseBackoff, upstreamRetryMaxBackoff
+	upstreamRetryBaseBackoff, upstreamRetryMaxBackoff = base, max
+	return func() {
+		upstreamRetryBaseBackoff, upstreamRetryMaxBackoff = prevBase, prevMax
+	}
+}
+
 type UpstreamError struct {
 	Operation  string
 	StatusCode int

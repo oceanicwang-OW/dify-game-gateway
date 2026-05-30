@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,17 @@ import (
 	"dify_gateway/internal/moderation"
 )
 
+const testAPIKey = "test-key"
+
+// TestMain shrinks the dify retry backoff so the retry-path integration tests
+// (429/5xx) don't sleep on the production backoff.
+func TestMain(m *testing.M) {
+	restore := dify.SetRetryBackoffForTest(time.Millisecond, 5*time.Millisecond)
+	code := m.Run()
+	restore()
+	os.Exit(code)
+}
+
 // These tests exercise the full chat orchestration against a real dify.Client
 // talking to a scriptable mock Dify over HTTP (PDR M5-T1): real SSE parsing,
 // real retry/backoff, and the pipeline's error mapping end to end. Limiter/
@@ -21,7 +33,7 @@ import (
 
 func newIntegrationHandler(t *testing.T, mock *difymock.Server, lim *fakeLimiter, store *fakeStore, mod moderation.Moderator) *Handler {
 	t.Helper()
-	client := dify.NewClient(mock.URL, "test-key", mock.Client())
+	client := dify.NewClient(mock.URL, testAPIKey, mock.Client())
 	return New(Config{
 		Limiter:          lim,
 		Store:            store,
@@ -42,7 +54,7 @@ func chatText(sent []sentEnvelope) string {
 }
 
 func TestIntegrationNormalStream(t *testing.T) {
-	mock := difymock.New()
+	mock := difymock.New(testAPIKey)
 	defer mock.Close()
 	mock.SetChat(difymock.ChatBehavior{Events: []difymock.Event{
 		{Event: "message", TaskID: "task-1", ConversationID: "conv-1", Answer: "Hello"},
@@ -80,7 +92,7 @@ func TestIntegrationNormalStream(t *testing.T) {
 }
 
 func TestIntegrationMessageReplaceBlocks(t *testing.T) {
-	mock := difymock.New()
+	mock := difymock.New(testAPIKey)
 	defer mock.Close()
 	mock.SetChat(difymock.ChatBehavior{Events: []difymock.Event{
 		{Event: "message", TaskID: "task-1", ConversationID: "conv-1", Answer: "partial"},
@@ -104,7 +116,7 @@ func TestIntegrationMessageReplaceBlocks(t *testing.T) {
 }
 
 func TestIntegrationErrorEvent(t *testing.T) {
-	mock := difymock.New()
+	mock := difymock.New(testAPIKey)
 	defer mock.Close()
 	mock.SetChat(difymock.ChatBehavior{Events: []difymock.Event{
 		{Event: "error", Code: "provider_error", Message: "boom"},
@@ -127,7 +139,7 @@ func TestIntegrationErrorEvent(t *testing.T) {
 }
 
 func TestIntegrationRateLimitRetriesThenSucceeds(t *testing.T) {
-	mock := difymock.New()
+	mock := difymock.New(testAPIKey)
 	defer mock.Close()
 	mock.SetChat(difymock.ChatBehavior{
 		Status:     429,
@@ -159,9 +171,9 @@ func TestIntegrationRateLimitRetriesThenSucceeds(t *testing.T) {
 }
 
 func TestIntegrationServerErrorExhaustedMapsUpstreamError(t *testing.T) {
-	mock := difymock.New()
+	mock := difymock.New(testAPIKey)
 	defer mock.Close()
-	mock.SetChat(difymock.ChatBehavior{Status: 500, RetryAfter: "0"}) // every attempt 5xx
+	mock.SetChat(difymock.ChatBehavior{Status: 500, FailForever: true, RetryAfter: "0"}) // every attempt 5xx
 
 	lim := &fakeLimiter{}
 	h := newIntegrationHandler(t, mock, lim, &fakeStore{conversation: "conv-1"}, moderation.AllowAll{})
@@ -183,7 +195,7 @@ func TestIntegrationServerErrorExhaustedMapsUpstreamError(t *testing.T) {
 }
 
 func TestIntegrationUpstreamTimeout(t *testing.T) {
-	mock := difymock.New()
+	mock := difymock.New(testAPIKey)
 	defer mock.Close()
 	mock.SetChat(difymock.ChatBehavior{Hang: true}) // never responds
 
@@ -206,7 +218,7 @@ func TestIntegrationUpstreamTimeout(t *testing.T) {
 }
 
 func TestIntegrationStopMidStreamAbortsUpstream(t *testing.T) {
-	mock := difymock.New()
+	mock := difymock.New(testAPIKey)
 	defer mock.Close()
 	mock.SetChat(difymock.ChatBehavior{Events: []difymock.Event{
 		{Event: "message", TaskID: "task-9", ConversationID: "conv-1", Answer: "First sentence."},
@@ -219,21 +231,11 @@ func TestIntegrationStopMidStreamAbortsUpstream(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var sent []sentEnvelope
-	send := func(env *gatewaypb.ServerEnvelope) error {
-		switch body := env.GetBody().(type) {
-		case *gatewaypb.ServerEnvelope_Chunk:
-			sent = append(sent, sentEnvelope{kind: "chunk", text: body.Chunk.GetDelta()})
-			cancel() // simulate a client StopRequest after the first delta
-		case *gatewaypb.ServerEnvelope_Done:
-			sent = append(sent, sentEnvelope{kind: "done"})
-		case *gatewaypb.ServerEnvelope_Error:
-			sent = append(sent, sentEnvelope{kind: "error", code: body.Error.GetCode()})
-		case *gatewaypb.ServerEnvelope_Blocked:
-			sent = append(sent, sentEnvelope{kind: "blocked"})
-		}
-		return nil
-	}
+	// Cancel on the first emitted chunk to simulate a client StopRequest. The
+	// answer ends in a sentence terminator, so the OutputFilter emits it as a
+	// chunk; by the time onDelta (hence this hook) runs, ChatStream's onEvent has
+	// already captured the task_id, so the stop can target it upstream.
+	send, sent := captureSend(t, cancel)
 
 	h.HandleChat(ctx, authedSession("player-1"), &gatewaypb.ChatRequest{
 		RequestId: "req-1", NpcId: "npc", Query: "hi",
@@ -243,9 +245,9 @@ func TestIntegrationStopMidStreamAbortsUpstream(t *testing.T) {
 	if len(stops) != 1 || stops[0].TaskID != "task-9" || stops[0].User != "player-1:npc" {
 		t.Fatalf("stop calls = %#v, want one stop for task-9 / player-1:npc", stops)
 	}
-	for _, e := range sent {
+	for _, e := range *sent {
 		if e.kind == "error" {
-			t.Fatalf("unexpected error frame on stop: %#v", sent)
+			t.Fatalf("unexpected error frame on stop: %#v", *sent)
 		}
 	}
 	if lim.failureCalls != 0 || lim.releaseCalls != 1 {

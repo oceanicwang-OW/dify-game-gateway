@@ -154,13 +154,18 @@ type sentEnvelope struct {
 	toks uint32
 }
 
-func captureSend(t *testing.T) (func(*gatewaypb.ServerEnvelope) error, *[]sentEnvelope) {
+// captureSend records every ServerEnvelope into the returned slice. Optional
+// onChunk hooks fire after a ChatChunk is recorded (e.g. to cancel mid-stream).
+func captureSend(t *testing.T, onChunk ...func()) (func(*gatewaypb.ServerEnvelope) error, *[]sentEnvelope) {
 	t.Helper()
 	var sent []sentEnvelope
 	return func(env *gatewaypb.ServerEnvelope) error {
 		switch body := env.GetBody().(type) {
 		case *gatewaypb.ServerEnvelope_Chunk:
 			sent = append(sent, sentEnvelope{kind: "chunk", id: body.Chunk.GetRequestId(), text: body.Chunk.GetDelta()})
+			for _, hook := range onChunk {
+				hook()
+			}
 		case *gatewaypb.ServerEnvelope_Done:
 			sent = append(sent, sentEnvelope{kind: "done", id: body.Done.GetRequestId(), text: body.Done.GetConversationId(), toks: body.Done.GetTotalTokens()})
 		case *gatewaypb.ServerEnvelope_Error:

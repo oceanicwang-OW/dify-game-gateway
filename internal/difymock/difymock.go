@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -37,16 +38,21 @@ type Event struct {
 	TotalTokens int
 }
 
-// ChatBehavior scripts how the mock answers POST /chat-messages.
+// ChatBehavior scripts how the mock answers POST /chat-messages. Its zero value
+// streams Events with no error injection, so error injection is always opt-in.
 type ChatBehavior struct {
-	// Status, when >= 400, makes the endpoint return that HTTP status (with Body
-	// and optional RetryAfter) instead of streaming. Combined with FailTimes it
-	// fails the first FailTimes attempts then streams Events; with FailTimes == 0
-	// every attempt returns Status (retry exhaustion).
+	// Status is the HTTP status (>= 400) to inject, with Body and optional
+	// RetryAfter. It is applied per the FailTimes / FailForever knobs below; on
+	// its own (both zero/false) no error is injected and Events are streamed.
 	Status     int
 	Body       string
 	RetryAfter string
-	FailTimes  int
+
+	// FailTimes injects Status on the first N attempts, then streams Events
+	// (models retry-then-recover). FailForever injects Status on every attempt
+	// (models retry exhaustion) and takes precedence over FailTimes.
+	FailTimes   int
+	FailForever bool
 
 	// Hang blocks the handler until the request context is cancelled, simulating
 	// an upstream that never responds (client-side timeout / Stop).
@@ -77,6 +83,7 @@ type StopCall struct {
 type Server struct {
 	*httptest.Server
 
+	apiKey    string
 	mu        sync.Mutex
 	chat      ChatBehavior
 	chatN     int
@@ -84,15 +91,25 @@ type Server struct {
 	stopCalls []StopCall
 }
 
-// New starts a mock Dify server. The default chat behavior streams nothing and
-// must be configured with SetChat before use.
-func New() *Server {
-	s := &Server{}
+// New starts a mock Dify server. If apiKey is non-empty, requests must carry
+// "Authorization: Bearer <apiKey>" or the mock responds 401 (like real Dify).
+// The default chat behavior streams nothing and must be configured with SetChat.
+func New(apiKey string) *Server {
+	s := &Server{apiKey: apiKey}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/chat-messages", s.handleChat)
 	mux.HandleFunc("/chat-messages/", s.handleStop) // {task_id}/stop
 	s.Server = httptest.NewServer(mux)
 	return s
+}
+
+// authorized reports whether the request carries the expected bearer token.
+// When the server was created without an API key, all requests are authorized.
+func (s *Server) authorized(r *http.Request) bool {
+	if s.apiKey == "" {
+		return true
+	}
+	return r.Header.Get("Authorization") == "Bearer "+s.apiKey
 }
 
 // SetChat installs the behavior for subsequent chat requests.
@@ -135,8 +152,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	b := s.chat
 	s.mu.Unlock()
 
-	// Error injection: every attempt (FailTimes == 0) or the first FailTimes.
-	if b.Status >= 400 && (b.FailTimes == 0 || attempt <= b.FailTimes) {
+	if !s.authorized(r) {
+		http.Error(w, `{"code":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	if captured.Query == "" || captured.User == "" {
+		http.Error(w, `{"code":"invalid_param"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Error injection: every attempt (FailForever) or the first FailTimes attempts.
+	if b.Status >= 400 && (b.FailForever || attempt <= b.FailTimes) {
 		if b.RetryAfter != "" {
 			w.Header().Set("Retry-After", b.RetryAfter)
 		}
@@ -163,7 +189,15 @@ func (s *Server) streamSSE(w http.ResponseWriter, r *http.Request, events []Even
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	// Real Dify stamps task_id on every streaming event; propagate the first
+	// task_id seen onto later events that don't set their own.
+	streamTaskID := ""
 	for _, ev := range events {
+		if ev.TaskID != "" {
+			streamTaskID = ev.TaskID
+		} else {
+			ev.TaskID = streamTaskID
+		}
 		if ev.Delay > 0 {
 			select {
 			case <-r.Context().Done():
@@ -213,11 +247,22 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// Path is /chat-messages/{task_id}/stop.
-	rest := strings.TrimPrefix(r.URL.Path, "/chat-messages/")
-	taskID := strings.TrimSuffix(rest, "/stop")
-	if taskID == rest || taskID == "" {
+	if !s.authorized(r) {
+		http.Error(w, `{"code":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	// Path is /chat-messages/{task_id}/stop. Parse the escaped path and unescape
+	// the segment so task_ids containing '/' (percent-encoded by the client) are
+	// recovered intact rather than splitting the route.
+	rest := strings.TrimPrefix(r.URL.EscapedPath(), "/chat-messages/")
+	enc := strings.TrimSuffix(rest, "/stop")
+	if enc == rest || enc == "" {
 		http.NotFound(w, r)
+		return
+	}
+	taskID, err := url.PathUnescape(enc)
+	if err != nil {
+		http.Error(w, `{"code":"invalid_param"}`, http.StatusBadRequest)
 		return
 	}
 
