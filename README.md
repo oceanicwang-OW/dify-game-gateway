@@ -4,7 +4,7 @@
 
 Dify 游戏 AI 网关是位于游戏客户端和 Dify 之间的 Go 服务层。它用于把 Dify App API Key 保留在服务端，将游戏请求转换为 Dify API 调用，把模型输出流式返回给游戏客户端，并为鉴权、限流、内容审核、可观测性和会话管理提供基础。
 
-本仓库仍处于里程碑开发阶段。当前已实现的范围包括项目骨架、配置加载、可观测性基座、Dify client 包、Protobuf 协议与分帧编解码、TCP 接入层、JWT 鉴权、Redis 会话存储、上下文装配、限流/配额/熔断、内容审核、对话主链路编排、中止与会话重置对接、Mock Dify 集成测试、进程内压测与安全加固审查。
+本仓库仍处于里程碑开发阶段。当前已实现的范围包括项目骨架、配置加载、可观测性基座、Dify client 包、Protobuf 协议与分帧编解码、TCP 接入层、JWT 鉴权、Redis 会话存储、上下文装配、限流/配额/熔断、内容审核、对话主链路编排、中止与会话重置对接、Mock Dify 集成测试、进程内压测、安全加固审查、完整进程组装和部署工作区。
 
 ### 功能特性
 
@@ -28,7 +28,7 @@ Dify 游戏 AI 网关是位于游戏客户端和 Dify 之间的 Go 服务层。�
 - 对话主链路编排：串起鉴权、限流、会话映射、上下文装配、输入审核、Dify 流式、输出审核、客户端回写和 token 记账（`internal/pipeline`）。
 - 中止与会话重置：`StopRequest` 用缓存的 task_id 调 Dify Stop 接口并关流（不计为上游失败）；`ResetRequest` 清除会话映射，使下条消息开启新会话（`internal/pipeline`、`internal/listener`）。
 
-尚未实现：完整进程组装（`cmd/gateway` 主程序）、部署文档与真实部署环境压测。
+尚未完成：测试集群部署验证、监控接入确认与真实部署环境压测。
 
 ### 目录结构
 
@@ -38,6 +38,7 @@ api/proto/            Protobuf 协议与生成的 Go 代码
 internal/config/      环境变量加载与校验
 internal/dify/        Dify REST 与 SSE client
 internal/codec/       长度前缀分帧与信封编解码
+internal/gateway/     进程组装、Dify App Key 路由与管理端点
 internal/listener/    TCP 接入层与连接生命周期
 internal/session/     连接会话状态与 player 绑定
 internal/mux/         单连接写串行化与请求多路复用
@@ -111,13 +112,22 @@ make lint
 
 ### 运行
 
-当前 `cmd/gateway` 仍是入口骨架，只会打印启动日志：
+`cmd/gateway` 会加载环境变量配置，初始化 JSON 日志、Redis、JWT 鉴权、限流/会话存储、Dify client、pipeline、TCP listener 和 admin HTTP 服务。运行前必须设置必填配置项：
 
 ```powershell
+$env:DIFY_BASE_URL = "http://localhost/v1"
+$env:DIFY_APP_KEYS = "default=app-your-key"
+$env:REDIS_ADDR = "localhost:6379"
+$env:AUTH_JWT_PUBKEY = "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
 go run ./cmd/gateway
 ```
 
-当前可直接在 Go 代码中使用 Dify client 包：
+运行后：
+
+- TCP 网关监听 `GATEWAY_ADDR`（默认 `:9000`）。
+- 管理端口监听 `GATEWAY_ADMIN_ADDR`（默认 `:9001`），提供 `/healthz`、`/readyz` 和 `/metrics`。
+
+也可直接在 Go 代码中使用 Dify client 包：
 
 ```go
 client := dify.NewClient("http://dify-api/v1", "app-key", nil)
@@ -188,10 +198,11 @@ docker run --rm `
 - M5-T1 Mock Dify 与集成测试
 - M5-T2 压测与稳定性
 - M5-T3 安全加固审查
+- M5-T4 进程组装与部署文档（仓库侧产物）
 
-下一个计划里程碑：
+下一步验证：
 
-- M5-T4 部署与文档
+- M5-T4 测试集群部署验证、监控接入确认与真实环境压测
 
 ### 安全注意事项
 
@@ -205,7 +216,7 @@ docker run --rm `
 
 Dify Game AI Gateway is a Go service layer between a game client and Dify. It keeps Dify App API keys on the server side, translates game requests into Dify API calls, streams model output back to the game client, and provides the foundation for auth, rate limiting, moderation, observability, and session management.
 
-This repository is under active milestone development. The implemented surface currently covers the project skeleton, configuration, telemetry, the Dify client package, the Protobuf protocol and frame codec, the TCP access layer, JWT authentication, the Redis session store, context assembly, rate limiting / quota / circuit breaking, moderation, main chat pipeline orchestration, stop/reset wiring, mock-Dify integration tests, in-process load testing, and the security hardening review.
+This repository is under active milestone development. The implemented surface currently covers the project skeleton, configuration, telemetry, the Dify client package, the Protobuf protocol and frame codec, the TCP access layer, JWT authentication, the Redis session store, context assembly, rate limiting / quota / circuit breaking, moderation, main chat pipeline orchestration, stop/reset wiring, mock-Dify integration tests, in-process load testing, the security hardening review, full process assembly, and the deployment workspace.
 
 ### Features
 
@@ -229,7 +240,7 @@ This repository is under active milestone development. The implemented surface c
 - Main chat pipeline orchestration across auth, limiter, session mapping, context assembly, input moderation, Dify streaming, output moderation, client writes, and token accounting (`internal/pipeline`).
 - Stop and conversation reset: `StopRequest` aborts the upstream generation via the cached task_id and closes the stream (not counted as an upstream failure); `ResetRequest` clears the conversation mapping so the next message starts fresh (`internal/pipeline`, `internal/listener`).
 
-Not yet implemented: full process assembly (the `cmd/gateway` entrypoint), deployment docs, and load testing against a real deployed environment.
+Not yet completed: test-cluster deployment validation, monitoring integration confirmation, and load testing against a real deployed environment.
 
 ### Repository Layout
 
@@ -239,6 +250,7 @@ api/proto/            Protobuf protocol and generated Go code
 internal/config/      Environment loading and validation
 internal/dify/        Dify REST and SSE client
 internal/codec/       Length-prefixed frame and envelope codec
+internal/gateway/     Process assembly, Dify App Key routing, and admin endpoints
 internal/listener/    TCP access layer and connection lifecycle
 internal/session/     Connection session state and player binding
 internal/mux/         Single-connection write serialization and request multiplexing
@@ -312,13 +324,22 @@ make lint
 
 ### Run
 
-The current `cmd/gateway` entrypoint is a skeleton and only logs startup:
+`cmd/gateway` loads environment configuration and initializes JSON logging, Redis, JWT auth, rate limiting/session storage, Dify clients, the pipeline, the TCP listener, and the admin HTTP server. Required configuration must be set before running:
 
 ```powershell
+$env:DIFY_BASE_URL = "http://localhost/v1"
+$env:DIFY_APP_KEYS = "default=app-your-key"
+$env:REDIS_ADDR = "localhost:6379"
+$env:AUTH_JWT_PUBKEY = "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
 go run ./cmd/gateway
 ```
 
-The Dify client package is usable from Go code today:
+After startup:
+
+- The TCP gateway listens on `GATEWAY_ADDR` (default `:9000`).
+- The admin server listens on `GATEWAY_ADMIN_ADDR` (default `:9001`) and exposes `/healthz`, `/readyz`, and `/metrics`.
+
+The Dify client package is also usable from Go code:
 
 ```go
 client := dify.NewClient("http://dify-api/v1", "app-key", nil)
@@ -389,10 +410,11 @@ Completed milestone scope:
 - M5-T1 mock Dify and integration tests
 - M5-T2 load testing and stability
 - M5-T3 security hardening review
+- M5-T4 process assembly and deployment docs (repo-side artifacts)
 
-Next planned milestone:
+Next validation step:
 
-- M5-T4 deployment and documentation
+- M5-T4 test-cluster deployment validation, monitoring integration confirmation, and real-environment load testing
 
 ### Security Notes
 
