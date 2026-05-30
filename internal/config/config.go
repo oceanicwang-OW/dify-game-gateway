@@ -121,7 +121,7 @@ func parseAppKeys(raw string) (map[string]string, error) {
 	}
 
 	keys := make(map[string]string)
-	for _, pair := range strings.Split(raw, ";") {
+	for i, pair := range strings.Split(raw, ";") {
 		pair = strings.TrimSpace(pair)
 		if pair == "" {
 			continue
@@ -130,7 +130,7 @@ func parseAppKeys(raw string) (map[string]string, error) {
 		name = strings.TrimSpace(name)
 		key = strings.TrimSpace(key)
 		if !ok || name == "" || key == "" {
-			return nil, fmt.Errorf("DIFY_APP_KEYS contains invalid mapping %q", pair)
+			return nil, fmt.Errorf("DIFY_APP_KEYS contains invalid mapping at position %d", i+1)
 		}
 		keys[name] = key
 	}

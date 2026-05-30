@@ -138,3 +138,21 @@ func TestLoadRejectsInvalidDifyAppKeyMapping(t *testing.T) {
 		t.Fatalf("Load() error %q does not mention DIFY_APP_KEYS", err.Error())
 	}
 }
+
+func TestLoadDoesNotLeakDifyAppKeyInParseErrors(t *testing.T) {
+	t.Setenv("DIFY_BASE_URL", "http://dify-api/v1")
+	t.Setenv("DIFY_APP_KEYS", "default=app-default;=app-secret-value")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("AUTH_JWT_PUBKEY", "pubkey")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want invalid DIFY_APP_KEYS error")
+	}
+	if strings.Contains(err.Error(), "app-secret-value") {
+		t.Fatalf("Load() error leaked app key: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "DIFY_APP_KEYS") {
+		t.Fatalf("Load() error %q does not mention DIFY_APP_KEYS", err.Error())
+	}
+}

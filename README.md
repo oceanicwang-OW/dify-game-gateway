@@ -4,7 +4,7 @@
 
 Dify 游戏 AI 网关是位于游戏客户端和 Dify 之间的 Go 服务层。它用于把 Dify App API Key 保留在服务端，将游戏请求转换为 Dify API 调用，把模型输出流式返回给游戏客户端，并为鉴权、限流、内容审核、可观测性和会话管理提供基础。
 
-本仓库仍处于里程碑开发阶段。当前已实现的范围包括项目骨架、配置加载、可观测性基座、Dify client 包、Protobuf 协议与分帧编解码、TCP 接入层、JWT 鉴权、Redis 会话存储、上下文装配、限流/配额/熔断、内容审核、对话主链路编排，以及中止与会话重置对接。
+本仓库仍处于里程碑开发阶段。当前已实现的范围包括项目骨架、配置加载、可观测性基座、Dify client 包、Protobuf 协议与分帧编解码、TCP 接入层、JWT 鉴权、Redis 会话存储、上下文装配、限流/配额/熔断、内容审核、对话主链路编排、中止与会话重置对接、Mock Dify 集成测试、进程内压测与安全加固审查。
 
 ### 功能特性
 
@@ -28,7 +28,7 @@ Dify 游戏 AI 网关是位于游戏客户端和 Dify 之间的 Go 服务层。�
 - 对话主链路编排：串起鉴权、限流、会话映射、上下文装配、输入审核、Dify 流式、输出审核、客户端回写和 token 记账（`internal/pipeline`）。
 - 中止与会话重置：`StopRequest` 用缓存的 task_id 调 Dify Stop 接口并关流（不计为上游失败）；`ResetRequest` 清除会话映射，使下条消息开启新会话（`internal/pipeline`、`internal/listener`）。
 
-尚未实现：完整进程组装（`cmd/gateway` 主程序）与 M5 联调、压测、安全加固和部署文档。
+尚未实现：完整进程组装（`cmd/gateway` 主程序）、部署文档与真实部署环境压测。
 
 ### 目录结构
 
@@ -187,10 +187,11 @@ docker run --rm `
 - M4-T2 中止与会话管理对接
 - M5-T1 Mock Dify 与集成测试
 - M5-T2 压测与稳定性
+- M5-T3 安全加固审查
 
 下一个计划里程碑：
 
-- M5-T3 安全加固审查
+- M5-T4 部署与文档
 
 ### 安全注意事项
 
@@ -204,7 +205,7 @@ docker run --rm `
 
 Dify Game AI Gateway is a Go service layer between a game client and Dify. It keeps Dify App API keys on the server side, translates game requests into Dify API calls, streams model output back to the game client, and provides the foundation for auth, rate limiting, moderation, observability, and session management.
 
-This repository is under active milestone development. The implemented surface currently covers the project skeleton, configuration, telemetry, the Dify client package, the Protobuf protocol and frame codec, the TCP access layer, JWT authentication, the Redis session store, context assembly, rate limiting / quota / circuit breaking, moderation, and main chat pipeline orchestration.
+This repository is under active milestone development. The implemented surface currently covers the project skeleton, configuration, telemetry, the Dify client package, the Protobuf protocol and frame codec, the TCP access layer, JWT authentication, the Redis session store, context assembly, rate limiting / quota / circuit breaking, moderation, main chat pipeline orchestration, stop/reset wiring, mock-Dify integration tests, in-process load testing, and the security hardening review.
 
 ### Features
 
@@ -228,7 +229,7 @@ This repository is under active milestone development. The implemented surface c
 - Main chat pipeline orchestration across auth, limiter, session mapping, context assembly, input moderation, Dify streaming, output moderation, client writes, and token accounting (`internal/pipeline`).
 - Stop and conversation reset: `StopRequest` aborts the upstream generation via the cached task_id and closes the stream (not counted as an upstream failure); `ResetRequest` clears the conversation mapping so the next message starts fresh (`internal/pipeline`, `internal/listener`).
 
-Not yet implemented: full process assembly (the `cmd/gateway` entrypoint) plus M5 integration tests, load testing, security hardening, and deployment docs.
+Not yet implemented: full process assembly (the `cmd/gateway` entrypoint), deployment docs, and load testing against a real deployed environment.
 
 ### Repository Layout
 
@@ -387,10 +388,11 @@ Completed milestone scope:
 - M4-T2 stop and conversation management wiring
 - M5-T1 mock Dify and integration tests
 - M5-T2 load testing and stability
+- M5-T3 security hardening review
 
 Next planned milestone:
 
-- M5-T3 security hardening review
+- M5-T4 deployment and documentation
 
 ### Security Notes
 

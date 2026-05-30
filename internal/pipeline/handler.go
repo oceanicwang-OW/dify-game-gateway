@@ -26,6 +26,7 @@ import (
 const (
 	defaultConversationTTL     = 24 * time.Hour
 	defaultConversationLockTTL = 15 * time.Second
+	maxQueryRunes              = 4096
 	// accountingTimeout bounds the post-stream limiter bookkeeping. It runs on
 	// a context detached from the request so a client disconnect cannot abort
 	// the in-flight slot release, while still capping how long a slow Redis can
@@ -118,6 +119,11 @@ func (h *Handler) HandleChat(ctx context.Context, sess *session.Session, req *ga
 	}
 	if query == "" {
 		h.send(send, errorMsg(reqID, "BAD_REQUEST", "query is required"))
+		telemetry.RequestsTotal.WithLabelValues("bad_request").Inc()
+		return
+	}
+	if queryTooLong(query) {
+		h.send(send, errorMsg(reqID, "BAD_REQUEST", "query is too long"))
 		telemetry.RequestsTotal.WithLabelValues("bad_request").Inc()
 		return
 	}
@@ -279,6 +285,17 @@ func (h *Handler) ready() error {
 	default:
 		return nil
 	}
+}
+
+func queryTooLong(query string) bool {
+	count := 0
+	for range query {
+		count++
+		if count > maxQueryRunes {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) resolveConversation(ctx context.Context, playerID, npcID, clientConvID string) (conversationID string, unlock func(), err error) {
